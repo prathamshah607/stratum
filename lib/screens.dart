@@ -290,10 +290,24 @@ class _LandingScreenState extends ConsumerState<LandingScreen> with SingleTicker
                         padding: EdgeInsets.all(18),
                         child: Center(child: SizedBox(height: 18, width: 18, child: CircularProgressIndicator(strokeWidth: 2))),
                       ),
-                      error: (_, __) => Padding(
-                        padding: const EdgeInsets.all(16),
-                        child: Text('SEARCH FAILED', style: theme.monoStyle.copyWith(color: theme.AppColors.red, fontSize: 12)),
-                      ),
+                      error: (error, stack) {
+                        // Keep the full exception in the browser/device logs
+                        // and expose it in the dropdown while diagnosing
+                        // Safari/iPad-specific geocoding failures.
+                        debugPrint('Geocoding search failed: $error');
+                        debugPrintStack(stackTrace: stack);
+
+                        return Padding(
+                          padding: const EdgeInsets.all(16),
+                          child: SelectableText(
+                            'SEARCH FAILED\n$error',
+                            style: theme.monoStyle.copyWith(
+                              color: theme.AppColors.red,
+                              fontSize: 12,
+                            ),
+                          ),
+                        );
+                      },
                     ),
                   ),
               ],
