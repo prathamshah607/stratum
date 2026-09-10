@@ -26,10 +26,14 @@
 //   EnsembleHourly    -> 55 values (surface + altitude/depth/pressure dimensions)
 //   ElevationApi/GeocodingApi -> no enum; requestJson() lookups only
 
+import 'dart:convert';
+import 'dart:js_interop';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:open_meteo/open_meteo.dart';
+import 'package:web/web.dart' as web;
 import 'models.dart';
 import 'screens.dart';
 
@@ -765,12 +769,44 @@ final locationMetaProvider = FutureProvider.family<Map<String, dynamic>, Locatio
 
 // Forward geocoding search for the landing-page autocomplete.
 final geocodingSearchProvider = FutureProvider.family<List<LocationParams>, String>((ref, query) async {
-  if (query.trim().length < 2) return [];
-  final api = GeocodingApi();
-  final res = await api.requestJson(name: query, count: 8);
-  final results = (res['results'] as List?) ?? [];
+  final normalizedQuery = query.trim();
+  if (normalizedQuery.length < 2) return [];
+
+  // Use an explicit HTTPS browser fetch for the GitHub Pages build. This
+  // avoids platform-specific behaviour in the package API wrapper and makes
+  // it impossible for an HTTP endpoint to become mixed content on Pages.
+  final uri = Uri.https(
+    'geocoding-api.open-meteo.com',
+    '/v1/search',
+    {
+      'name': normalizedQuery,
+      'count': '8',
+      'language': 'en',
+      'format': 'json',
+    },
+  );
+
+  final response = await web.window.fetch(uri.toString().toJS).toDart;
+  final body = (await response.text().toDart).toDart;
+
+  if (!response.ok) {
+    throw Exception('Geocoding API returned HTTP ${response.status}: $body');
+  }
+
+  final decoded = jsonDecode(body);
+  if (decoded is! Map<String, dynamic>) {
+    throw const FormatException('Unexpected geocoding response');
+  }
+
+  final results = (decoded['results'] as List?) ?? [];
   return results
-      .map((r) => LocationParams(name: r['name'] ?? query, lat: (r['latitude'] as num).toDouble(), lon: (r['longitude'] as num).toDouble()))
+      .whereType<Map<String, dynamic>>()
+      .where((r) => r['latitude'] is num && r['longitude'] is num)
+      .map((r) => LocationParams(
+            name: r['name'] as String? ?? normalizedQuery,
+            lat: (r['latitude'] as num).toDouble(),
+            lon: (r['longitude'] as num).toDouble(),
+          ))
       .toList();
 });
 
