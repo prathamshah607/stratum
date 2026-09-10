@@ -3,9 +3,11 @@
 // Three screens: LandingScreen (full-screen map + autocomplete search),
 // DashboardScreen (branded AppBar + TabBar + 9-mode IndexedStack), and the
 // mode-agnostic raw-data dialog (folded into _ModeGrid rather than a
-// separate route, per prior direction).
+// separate route, per prior direction) -- plus an inline split-screen raw
+// data panel toggleable from the app bar.
 
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
@@ -29,6 +31,21 @@ import 'aqi_gauge_widget.dart';
 const _appTitle = 'STRATUM';
 const _appSubtitle = 'OPEN CLIMATIC INTELLIGENCE';
 
+/// Readable timestamp for table rows -- "2026-03-14 09:00" instead of the
+/// raw ISO-8601 "2026-03-14T09:00:00.000Z" the T/Z separators produce.
+/// Values from the API are already UTC-normalized (see the various
+/// fromMillisecondsSinceEpoch(..., isUtc: true) calls below), so this just
+/// swaps the separator and drops the seconds/millis/zone suffix rather than
+/// converting timezones.
+String _formatTableTime(DateTime d) {
+  final y = d.year.toString().padLeft(4, '0');
+  final mo = d.month.toString().padLeft(2, '0');
+  final da = d.day.toString().padLeft(2, '0');
+  final h = d.hour.toString().padLeft(2, '0');
+  final mi = d.minute.toString().padLeft(2, '0');
+  return '$y-$mo-$da $h:$mi';
+}
+
 /// The tabbed modes shown in the dashboard. Elevation and Location (the two
 /// single-value metadata lookups, formerly shown as a "meta" tab that just
 /// pointed back at the header) are dropped entirely -- their data already
@@ -46,9 +63,10 @@ const _tabModes = <ModeType>[
 
 // ---------------------------------------------------------------------------
 // LandingScreen: full-bleed map is the entire canvas. Search lives in a
-// floating bar top-right with a proper autocomplete dropdown underneath it;
-// tapping a result (or the map itself) drops a pin and pushes into the
-// dashboard for that location.
+// full-width bar with a proper autocomplete dropdown underneath it; tapping
+// a result (or the map itself) drops a pin and pushes into the dashboard
+// for that location. The search bar pulses gently until the person starts
+// typing or picks a location, so it's obvious that's where to start.
 // ---------------------------------------------------------------------------
 
 class LandingScreen extends ConsumerStatefulWidget {
@@ -57,11 +75,21 @@ class LandingScreen extends ConsumerStatefulWidget {
   ConsumerState<LandingScreen> createState() => _LandingScreenState();
 }
 
-class _LandingScreenState extends ConsumerState<LandingScreen> {
+class _LandingScreenState extends ConsumerState<LandingScreen> with SingleTickerProviderStateMixin {
   final controller = TextEditingController();
   final focusNode = FocusNode();
   final mapController = MapController();
   LatLng? marker;
+  late final AnimationController _pulse;
+
+  @override
+  void initState() {
+    super.initState();
+    // Draws the eye to the search bar on first load -- stops (settles to
+    // its resting state) the moment the person starts typing or picks a
+    // location, via `drawAttention` in build() below.
+    _pulse = AnimationController(vsync: this, duration: const Duration(milliseconds: 1400))..repeat(reverse: true);
+  }
 
   void _select(LocationParams loc) {
     setState(() {
@@ -79,6 +107,7 @@ class _LandingScreenState extends ConsumerState<LandingScreen> {
 
   @override
   void dispose() {
+    _pulse.dispose();
     controller.dispose();
     focusNode.dispose();
     super.dispose();
@@ -89,6 +118,7 @@ class _LandingScreenState extends ConsumerState<LandingScreen> {
     final query = controller.text.trim();
     final showDropdown = query.length >= 2;
     final results = showDropdown ? ref.watch(geocodingSearchProvider(query)) : null;
+    final drawAttention = marker == null && controller.text.isEmpty;
 
     return Scaffold(
       backgroundColor: theme.AppColors.bg,
@@ -141,7 +171,7 @@ class _LandingScreenState extends ConsumerState<LandingScreen> {
             top: 0,
             left: 0,
             right: 0,
-            height: 140,
+            height: 160,
             child: IgnorePointer(
               child: Container(
                 decoration: BoxDecoration(
@@ -166,40 +196,62 @@ class _LandingScreenState extends ConsumerState<LandingScreen> {
               ],
             ),
           ),
-          // Search bar + autocomplete dropdown, top-right.
+          // Full-width search bar + autocomplete dropdown, below the brand.
           Positioned(
-            top: 20,
+            top: 76,
+            left: 24,
             right: 24,
-            width: 420,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Material(
-                  color: theme.AppColors.panel.withOpacity(0.96),
-                  borderRadius: BorderRadius.circular(10),
-                  elevation: 10,
-                  shadowColor: Colors.black54,
-                  child: TextField(
-                    controller: controller,
-                    focusNode: focusNode,
-                    onChanged: (_) => setState(() {}),
-                    style: theme.monoStyle.copyWith(color: theme.AppColors.white, fontSize: 14),
-                    decoration: InputDecoration(
-                      hintText: 'Search any location on Earth...',
-                      hintStyle: theme.monoStyle.copyWith(color: theme.AppColors.grey, fontSize: 13),
-                      prefixIcon: Icon(Icons.search, color: theme.AppColors.grey, size: 20),
-                      suffixIcon: controller.text.isEmpty
-                          ? null
-                          : IconButton(
-                              icon: Icon(Icons.clear, color: theme.AppColors.grey, size: 18),
-                              onPressed: () => setState(() => controller.clear()),
-                            ),
-                      contentPadding: const EdgeInsets.symmetric(vertical: 14, horizontal: 4),
-                      filled: true,
-                      fillColor: Colors.transparent,
-                      border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide(color: theme.AppColors.border)),
-                      enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide(color: theme.AppColors.border)),
-                      focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide(color: theme.AppColors.amber)),
+                AnimatedBuilder(
+                  animation: _pulse,
+                  builder: (context, child) {
+                    final t = drawAttention ? _pulse.value : 0.0;
+                    return Container(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(10),
+                        boxShadow: [
+                          BoxShadow(
+                            color: theme.AppColors.amber.withOpacity(0.05 + t * 0.35),
+                            blurRadius: 8 + t * 20,
+                            spreadRadius: t * 3,
+                          ),
+                        ],
+                      ),
+                      child: child,
+                    );
+                  },
+                  child: Material(
+                    color: theme.AppColors.panel.withOpacity(0.96),
+                    borderRadius: BorderRadius.circular(10),
+                    elevation: 10,
+                    shadowColor: Colors.black54,
+                    child: TextField(
+                      controller: controller,
+                      focusNode: focusNode,
+                      onChanged: (_) => setState(() {}),
+                      style: theme.monoStyle.copyWith(color: theme.AppColors.white, fontSize: 15),
+                      decoration: InputDecoration(
+                        hintText: 'Search any location on Earth...',
+                        hintStyle: theme.monoStyle.copyWith(color: theme.AppColors.grey, fontSize: 14),
+                        prefixIcon: Icon(Icons.search, color: theme.AppColors.grey, size: 22),
+                        suffixIcon: controller.text.isEmpty
+                            ? null
+                            : IconButton(
+                                icon: Icon(Icons.clear, color: theme.AppColors.grey, size: 18),
+                                onPressed: () => setState(() => controller.clear()),
+                              ),
+                        contentPadding: const EdgeInsets.symmetric(vertical: 16, horizontal: 4),
+                        filled: true,
+                        fillColor: Colors.transparent,
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide(color: theme.AppColors.border)),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide(color: drawAttention ? Color.lerp(theme.AppColors.border, theme.AppColors.amber, _pulse.value)! : theme.AppColors.border, width: drawAttention ? 1.4 : 1),
+                        ),
+                        focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(10), borderSide: BorderSide(color: theme.AppColors.amber)),
+                      ),
                     ),
                   ),
                 ),
@@ -247,15 +299,37 @@ class _LandingScreenState extends ConsumerState<LandingScreen> {
               ],
             ),
           ),
-          // Hint footer.
+          // Hint footer -- full width, bigger, and now explicitly points
+          // back up at the search bar as the other way in.
           Positioned(
-            bottom: 20,
+            bottom: 24,
             left: 24,
+            right: 24,
             child: IgnorePointer(
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                decoration: BoxDecoration(color: theme.AppColors.panel.withOpacity(0.8), borderRadius: BorderRadius.circular(6)),
-                child: Text('TAP ANYWHERE ON THE MAP TO EXPLORE THAT LOCATION', style: theme.monoStyle.copyWith(color: theme.AppColors.grey, fontSize: 10, letterSpacing: 0.5)),
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: theme.AppColors.panel.withOpacity(0.85),
+                  borderRadius: BorderRadius.circular(8),
+                  border: Border.all(color: theme.AppColors.border),
+                ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'TAP ANYWHERE ON THE MAP TO EXPLORE THAT LOCATION',
+                      textAlign: TextAlign.center,
+                      style: theme.monoStyle.copyWith(color: theme.AppColors.white, fontSize: 15, fontWeight: FontWeight.bold, letterSpacing: 0.8),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      'OR SEARCH FOR A LOCATION USING THE BOX AT THE TOP',
+                      textAlign: TextAlign.center,
+                      style: theme.monoStyle.copyWith(color: theme.AppColors.grey, fontSize: 11, letterSpacing: 0.5),
+                    ),
+                  ],
+                ),
               ),
             ),
           ),
@@ -267,9 +341,13 @@ class _LandingScreenState extends ConsumerState<LandingScreen> {
 
 // ---------------------------------------------------------------------------
 // DashboardScreen: branded AppBar ("STRATUM - OPEN CLIMATIC INTELLIGENCE")
-// with a Material TabBar for the 9 modes. Body keeps the IndexedStack (not
-// TabBarView) so each mode's keepAlive'd dataProvider is never rebuilt just
-// because the user switched tabs and back.
+// with location/lat-lon/elevation and the CHANGE LOCATION / unit-system
+// controls now living IN the app bar itself, plus a Material TabBar for the
+// 9 modes. Body is graph-view only by default; toggling the data-table icon
+// in the app bar splits it side-by-side with a live raw data table for the
+// current mode. Body keeps the IndexedStack (not TabBarView) so each mode's
+// keepAlive'd dataProvider is never rebuilt just because the user switched
+// tabs and back.
 // ---------------------------------------------------------------------------
 
 class DashboardScreen extends ConsumerStatefulWidget {
@@ -288,6 +366,13 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> with SingleTi
   /// calls at once -- this, plus dataProvider's existing keepAlive cache,
   /// is what makes a revisit instant instead of a reload.
   final Set<int> _builtTabs = {};
+
+  /// Split-screen toggle: graphs alongside a live raw data table for
+  /// whichever mode is currently selected, reusing the SAME dataProvider
+  /// call the graph grid already makes (identical FetchParams => cache hit,
+  /// not a second fetch). Defaults to visible -- the table icon in the app
+  /// bar just hides/shows it rather than being the only way to see it.
+  bool _splitDataTable = true;
 
   @override
   void initState() {
@@ -331,81 +416,70 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> with SingleTi
         surfaceTintColor: Colors.transparent,
         elevation: 0,
         titleSpacing: 20,
-        title: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(_appTitle, style: theme.monoStyle.copyWith(fontSize: 17, color: theme.AppColors.amber, letterSpacing: 3, fontWeight: FontWeight.bold)),
-            Text('- $_appSubtitle', style: theme.monoStyle.copyWith(fontSize: 9, color: theme.AppColors.grey, letterSpacing: 1.5)),
-          ],
-        ),
-        // Master date range (2 fields: START / END) sits above the tab bar,
-        // replacing the old 24H/7D/1M/3M preset picker -- every mode below
-        // reads its window directly from these two fields now.
+        toolbarHeight: 68,
+        title: _AppBarLocationInfo(location: appState.location!),
+        actions: [
+          DateRangeBar(
+            start: appState.rangeStart,
+            end: appState.rangeEnd,
+            onStartChanged: (d) => ref.read(appStateProvider.notifier).setRangeStart(d, router),
+            onEndChanged: (d) => ref.read(appStateProvider.notifier).setRangeEnd(d, router),
+          ),
+          const SizedBox(width: 12),
+          UnitToggle(active: unitSystem, onChanged: (s) => ref.read(appStateProvider.notifier).setUnits(s, router)),
+          const SizedBox(width: 12),
+          IconButton(
+            tooltip: _splitDataTable ? 'Hide raw data table' : 'Show raw data table',
+            icon: Icon(Icons.table_chart_outlined, color: _splitDataTable ? theme.AppColors.amber : theme.AppColors.grey),
+            onPressed: () => setState(() => _splitDataTable = !_splitDataTable),
+          ),
+          const SizedBox(width: 16),
+        ],
         bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(92),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              DateRangeBar(
-                start: appState.rangeStart,
-                end: appState.rangeEnd,
-                onStartChanged: (d) => ref.read(appStateProvider.notifier).setRangeStart(d, router),
-                onEndChanged: (d) => ref.read(appStateProvider.notifier).setRangeEnd(d, router),
-              ),
-              TabBar(
-                controller: _tabController,
-                isScrollable: false,
-                indicatorColor: theme.AppColors.amber,
-                indicatorWeight: 2,
-                labelColor: theme.AppColors.amber,
-                unselectedLabelColor: theme.AppColors.grey,
-                labelStyle: theme.monoStyle.copyWith(fontSize: 12, letterSpacing: 0.5),
-                tabs: [for (final mode in _tabModes) Tab(text: mode.label.toUpperCase())],
-              ),
-            ],
+          preferredSize: const Size.fromHeight(48),
+          child: TabBar(
+            controller: _tabController,
+            isScrollable: false,
+            indicatorColor: theme.AppColors.amber,
+            indicatorWeight: 2,
+            labelColor: theme.AppColors.amber,
+            unselectedLabelColor: theme.AppColors.grey,
+            labelStyle: theme.monoStyle.copyWith(fontSize: 12, letterSpacing: 0.5),
+            tabs: [for (final mode in _tabModes) Tab(text: mode.label.toUpperCase())],
           ),
         ),
       ),
-      body: Column(
+      // Body is graph view only by default. Toggling the data-table icon
+      // above splits it side-by-side with a live raw data table for the
+      // currently selected mode.
+      body: Row(
         children: [
-          _LocationHeader(
-            location: appState.location!,
-            trailing: Wrap(
-              crossAxisAlignment: WrapCrossAlignment.center,
-              spacing: 12,
-              runSpacing: 6,
-              children: [
-                OutlinedButton.icon(
-                  onPressed: () => router.go('/'),
-                  icon: Icon(Icons.edit_location_alt_outlined, size: 16, color: theme.AppColors.amber),
-                  label: Text('CHANGE LOCATION', style: theme.monoStyle.copyWith(color: theme.AppColors.amber, fontSize: 11)),
-                  style: OutlinedButton.styleFrom(side: BorderSide(color: theme.AppColors.border)),
-                ),
-                UnitToggle(active: unitSystem, onChanged: (s) => ref.read(appStateProvider.notifier).setUnits(s, router)),
-              ],
-            ),
-          ),
           Expanded(
+            flex: _splitDataTable ? 3 : 1,
             child: IndexedStack(
               index: currentIndex,
               children: [for (var i = 0; i < _tabModes.length; i++) _builtTabs.contains(i) ? _ModeView(mode: _tabModes[i]) : const SizedBox.shrink()],
             ),
           ),
+          if (_splitDataTable) Container(width: 1, color: theme.AppColors.border),
+          if (_splitDataTable) Expanded(flex: 2, child: _RawDataTableView(mode: appState.mode)),
         ],
       ),
     );
   }
 }
 
-class _LocationHeader extends ConsumerWidget {
+/// Compact location readout for the app bar: name + lat/lon + elevation.
+/// Elevation comes from the same keepAlive'd locationMetaProvider the old
+/// body-level header used, just relocated.
+class _AppBarLocationInfo extends ConsumerWidget {
   final LocationParams location;
-  final Widget trailing;
-  const _LocationHeader({required this.location, required this.trailing});
+  const _AppBarLocationInfo({required this.location});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final meta = ref.watch(locationMetaProvider(location));
+    final router = ref.watch(routerProvider);
     final elevation = meta.maybeWhen(
       data: (d) {
         final results = (d['elevation']?['elevation'] as List?);
@@ -413,26 +487,28 @@ class _LocationHeader extends ConsumerWidget {
       },
       orElse: () => '--',
     );
-    return Container(
-      color: panelColor,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          final compact = constraints.maxWidth < 760;
-          final info = Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(location.name.toUpperCase(), style: monoStyle.copyWith(fontSize: 20, color: theme.AppColors.white), maxLines: 1, overflow: TextOverflow.ellipsis),
-              Text('LAT ${location.lat.toStringAsFixed(4)}  LON ${location.lon.toStringAsFixed(4)}  ELEV $elevation', style: monoStyle.copyWith(fontSize: 11, color: theme.AppColors.grey)),
-            ],
-          );
-          if (compact) {
-            return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [info, const SizedBox(height: 10), trailing]);
-          }
-          return Row(children: [Expanded(child: info), trailing]);
-        },
-      ),
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        Flexible(
+          child: Text(
+            location.name.toUpperCase(),
+            style: monoStyle.copyWith(fontSize: 22, color: theme.AppColors.amber, fontWeight: FontWeight.bold),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+        const SizedBox(width: 24),
+        Text('LAT ${location.lat.toStringAsFixed(4)}  LON ${location.lon.toStringAsFixed(4)}  ELEV $elevation', style: monoStyle.copyWith(fontSize: 16, color: theme.AppColors.grey)),
+        const SizedBox(width: 24),
+        OutlinedButton.icon(
+          onPressed: () => router.go('/'),
+          icon: const Icon(Icons.edit_location_alt_outlined, size: 16, color: theme.AppColors.amber),
+          label: Text('CHANGE LOCATION', style: monoStyle.copyWith(color: theme.AppColors.amber, fontSize: 11)),
+          style: OutlinedButton.styleFrom(side: const BorderSide(color: theme.AppColors.border)),
+        ),
+      ],
     );
   }
 }
@@ -533,6 +609,60 @@ class _GridItem {
   final bool hasData;
   final Widget Function() builder;
   const _GridItem({required this.label, required this.hasData, required this.builder});
+}
+
+/// Wraps any chart/panel so tapping it opens the SAME chart full-screen.
+/// `builder` (not a pre-built widget) is stored and re-invoked for the
+/// full-screen route -- the grid's own copy stays mounted underneath
+/// (IndexedStack keeps the mode alive) while a fresh instance renders large
+/// in the pushed route.
+class _FullscreenableChart extends StatelessWidget {
+  final String label;
+  final Widget Function() builder;
+  const _FullscreenableChart({required this.label, required this.builder});
+
+  void _open(BuildContext context) {
+    Navigator.of(context, rootNavigator: true).push(MaterialPageRoute(
+      fullscreenDialog: true,
+      builder: (context) => Scaffold(
+        backgroundColor: theme.AppColors.bg,
+        appBar: AppBar(
+          backgroundColor: theme.AppColors.panel,
+          elevation: 0,
+          title: Text(label.toUpperCase(), style: theme.monoStyle.copyWith(color: theme.AppColors.amber, fontSize: 13, letterSpacing: 1)),
+          leading: IconButton(icon: const Icon(Icons.close), onPressed: () => Navigator.of(context).pop()),
+        ),
+        body: Padding(padding: const EdgeInsets.all(20), child: SizedBox.expand(child: builder())),
+      ),
+    ));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MouseRegion(
+      cursor: SystemMouseCursors.click,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () => _open(context),
+        // builder() is a non-positioned child, so Stack sizes itself off
+        // the chart's own natural/bounded size -- this works whether the
+        // caller wrapped it in a fixed-height SizedBox (grid panels) or
+        // left it to size itself intrinsically (the calendar heatmap).
+        child: Stack(
+          children: [
+            builder(),
+            Positioned(
+              top: 6,
+              right: 6,
+              child: IgnorePointer(
+                child: Icon(Icons.fullscreen, size: 16, color: theme.AppColors.greyDim),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
 }
 
 class _ModeGrid extends ConsumerWidget {
@@ -650,7 +780,10 @@ class _ModeGrid extends ConsumerWidget {
                       child: Builder(builder: (context) {
                         final (dates, values) = pairedSeriesFull(spec.jsonKey);
                         if (values.isEmpty) return _EmptyRow(label: spec.label);
-                        return CalendarHeatmap(label: spec.label, unit: spec.unitLabel(units), dates: dates, values: values);
+                        return _FullscreenableChart(
+                          label: spec.label,
+                          builder: () => CalendarHeatmap(label: spec.label, unit: spec.unitLabel(units), dates: dates, values: values),
+                        );
                       }),
                     ),
                 ],
@@ -771,7 +904,7 @@ class _ModeGrid extends ConsumerWidget {
             padding: const EdgeInsets.all(12),
             child: OutlinedButton(
               onPressed: () => ref.read(appStateProvider.notifier).goToDataTable(ref.read(routerProvider)),
-              child: const Text('VIEW RAW DATA TABLE'),
+              child: const Text('VIEW RAW DATA TABLE (FULL PAGE)'),
             ),
           ),
         ],
@@ -890,7 +1023,9 @@ class _ModeGrid extends ConsumerWidget {
 /// this gives every chart the full window width to render its time axis in
 /// detail instead of squeezing 2-3 across. Items with no data render as a
 /// small fixed-height rectangle (_EmptyRow) instead of a full 420px blank
-/// panel, and their (often chart-heavy) widget is never built at all.
+/// panel, and their (often chart-heavy) widget is never built at all. Every
+/// panel with data is tappable -- see _FullscreenableChart -- to open the
+/// same chart full-screen.
 class _DynamicGrid extends StatelessWidget {
   final List<_GridItem> items;
   final EdgeInsets padding;
@@ -908,7 +1043,13 @@ class _DynamicGrid extends StatelessWidget {
             Padding(
               padding: EdgeInsets.only(bottom: i == items.length - 1 ? 0 : 12),
               child: items[i].hasData
-                  ? SizedBox(height: _rowHeight, width: double.infinity, child: RepaintBoundary(child: items[i].builder()))
+                  ? SizedBox(
+                      height: _rowHeight,
+                      width: double.infinity,
+                      child: RepaintBoundary(
+                        child: _FullscreenableChart(label: items[i].label, builder: items[i].builder),
+                      ),
+                    )
                   : _EmptyRow(label: items[i].label),
             ),
         ],
@@ -942,18 +1083,32 @@ class _EmptyRow extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// DataTableScreen: dedicated /explore/data page. Virtualized rows
-// (ListView.builder, not the eager DataTable widget), sortable columns, a
-// search box, per-column visibility, and CSV/JSON export.
+// Raw data table -- ONE virtualized, sortable, searchable, exportable table
+// implementation shared by both the app bar's split-screen sidebar and the
+// standalone /explore/data page. The sidebar previously used a separate,
+// simpler RawDataTable (widgets.dart) built on a plain DataTable widget
+// inside only a horizontal SingleChildScrollView -- with no vertical scroll
+// view wrapping it, so anything past the panel's visible height just
+// overflowed instead of scrolling. Reusing THIS table (ListView.builder +
+// itemExtent, the same virtualized approach the full page already used)
+// fixes that outright rather than patching the old one, and means the
+// sidebar and the full page can never drift out of sync again.
 // ---------------------------------------------------------------------------
 
-class DataTableScreen extends ConsumerStatefulWidget {
-  const DataTableScreen({super.key});
+class _RawDataTableView extends ConsumerStatefulWidget {
+  final ModeType mode;
+  /// When non-null, a back button calling this is shown in the toolbar --
+  /// used by the standalone DataTableScreen route. The split-screen sidebar
+  /// leaves this null since there's nowhere to "go back" to from a panel
+  /// that's already sitting next to the graphs.
+  final VoidCallback? onBack;
+  const _RawDataTableView({required this.mode, this.onBack});
+
   @override
-  ConsumerState<DataTableScreen> createState() => _DataTableScreenState();
+  ConsumerState<_RawDataTableView> createState() => _RawDataTableViewState();
 }
 
-class _DataTableScreenState extends ConsumerState<DataTableScreen> {
+class _RawDataTableViewState extends ConsumerState<_RawDataTableView> {
   String search = '';
   int? sortColumn;
   bool sortAsc = true;
@@ -963,18 +1118,21 @@ class _DataTableScreenState extends ConsumerState<DataTableScreen> {
   @override
   Widget build(BuildContext context) {
     final appState = ref.watch(appStateProvider);
-    final router = ref.watch(routerProvider);
     if (appState.location == null) return const SizedBox.shrink();
     final units = ref.watch(unitSettingsProvider);
-    final fields = ref.watch(activeFieldsProvider(appState.mode));
-    final rawResolution = appState.mode == ModeType.weather
+    final fields = ref.watch(activeFieldsProvider(widget.mode));
+    final rawResolution = widget.mode == ModeType.weather
         ? appState.weatherResolution
-        : appState.mode == ModeType.historical
+        : widget.mode == ModeType.historical
             ? appState.historicalResolution
             : TemporalResolution.hourly;
     final resolution = isLongRange(appState.rangeStart, appState.rangeEnd) ? TemporalResolution.daily : rawResolution;
+    // Identical FetchParams to whatever the graph grid for this mode is
+    // already fetching with -- dataProvider's keepAlive cache serves this
+    // from the exact same in-flight or completed request, so showing the
+    // table alongside the graphs is never a second network call.
     final params = FetchParams(
-      mode: appState.mode,
+      mode: widget.mode,
       location: appState.location!,
       rangeStart: appState.rangeStart,
       rangeEnd: appState.rangeEnd,
@@ -984,26 +1142,21 @@ class _DataTableScreenState extends ConsumerState<DataTableScreen> {
     );
     final asyncData = ref.watch(dataProvider(params));
 
-    return Scaffold(
-      backgroundColor: bgColor,
-      body: SafeArea(
-        child: asyncData.when(
-          loading: () => const Center(child: CircularProgressIndicator()),
-          error: (e, _) => Center(child: Text('Error: $e', style: monoStyle.copyWith(color: theme.AppColors.red))),
-          data: (data) => _buildTable(router, appState, data, fields, units, resolution),
-        ),
-      ),
+    return asyncData.when(
+      loading: () => const Center(child: CircularProgressIndicator()),
+      error: (e, _) => Center(child: Text('Error: $e', style: monoStyle.copyWith(color: theme.AppColors.red))),
+      data: (data) => _buildTable(appState, data, fields, units, resolution),
     );
   }
 
-  Widget _buildTable(GoRouter router, AppState appState, Map<String, dynamic> data, List<FieldSpec> fields, UnitSettings units, TemporalResolution resolution) {
-    final series = appState.mode == ModeType.weather
+  Widget _buildTable(AppState appState, Map<String, dynamic> data, List<FieldSpec> fields, UnitSettings units, TemporalResolution resolution) {
+    final series = widget.mode == ModeType.weather
         ? ((resolution == TemporalResolution.daily ? data['daily'] : data['hourly']) as Map<String, dynamic>?) ?? {}
         : (data['hourly'] as Map<String, dynamic>?) ?? (data['daily'] as Map<String, dynamic>?) ?? {};
     final rawTimes = (series['time'] as List?) ?? [];
     final times = [
       for (final t in rawTimes)
-        if (t is num) DateTime.fromMillisecondsSinceEpoch(t.toInt() * 1000, isUtc: true).toIso8601String() else '$t'
+        if (t is num) _formatTableTime(DateTime.fromMillisecondsSinceEpoch(t.toInt() * 1000, isUtc: true)) else '$t'
     ];
     final visibleFields = fields.where((f) => !hiddenColumns.contains(f.jsonKey)).toList();
     final columns = ['time', for (final f in visibleFields) '${f.label} (${f.unitLabel(units)})'];
@@ -1027,51 +1180,60 @@ class _DataTableScreenState extends ConsumerState<DataTableScreen> {
         Container(
           color: panelColor,
           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-          child: Row(children: [
-            IconButton(
-              icon: Icon(Icons.arrow_back, color: theme.AppColors.amber),
-              onPressed: () => ref.read(appStateProvider.notifier).goToDashboard(router),
-            ),
-            Text('${appState.mode.label.toUpperCase()} — RAW DATA (${rows.length} ROWS)', style: monoStyle.copyWith(fontSize: 13, color: theme.AppColors.white)),
-            const Spacer(),
-            SizedBox(
-              width: 220,
-              height: 34,
-              child: TextField(
-                style: monoStyle.copyWith(color: theme.AppColors.white, fontSize: 12),
-                decoration: InputDecoration(
-                  isDense: true,
-                  hintText: 'SEARCH',
-                  hintStyle: monoStyle.copyWith(color: theme.AppColors.grey, fontSize: 12),
-                  prefixIcon: Icon(Icons.search, color: theme.AppColors.grey, size: 16),
-                  border: OutlineInputBorder(borderSide: BorderSide(color: theme.AppColors.border)),
+          child: Wrap(
+            crossAxisAlignment: WrapCrossAlignment.center,
+            spacing: 10,
+            runSpacing: 8,
+            children: [
+              if (widget.onBack != null)
+                IconButton(
+                  icon: Icon(Icons.arrow_back, color: theme.AppColors.amber),
+                  onPressed: widget.onBack,
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(),
                 ),
-                onChanged: (v) => setState(() => search = v),
+              Text('${widget.mode.label.toUpperCase()} — RAW DATA (${rows.length} ROWS)', style: monoStyle.copyWith(fontSize: 12, color: theme.AppColors.white)),
+              SizedBox(
+                width: 200,
+                height: 32,
+                child: TextField(
+                  style: monoStyle.copyWith(color: theme.AppColors.white, fontSize: 12),
+                  decoration: InputDecoration(
+                    isDense: true,
+                    hintText: 'SEARCH',
+                    hintStyle: monoStyle.copyWith(color: theme.AppColors.grey, fontSize: 12),
+                    prefixIcon: Icon(Icons.search, color: theme.AppColors.grey, size: 16),
+                    border: OutlineInputBorder(borderSide: BorderSide(color: theme.AppColors.border)),
+                  ),
+                  onChanged: (v) => setState(() => search = v),
+                ),
               ),
-            ),
-            const SizedBox(width: 12),
-            PopupMenuButton<String>(
-              tooltip: 'Columns',
-              icon: Icon(Icons.view_column, color: theme.AppColors.grey),
-              itemBuilder: (context) => [
-                for (final f in fields) CheckedPopupMenuItem(value: f.jsonKey, checked: !hiddenColumns.contains(f.jsonKey), child: Text(f.label, style: monoStyle.copyWith(fontSize: 12))),
-              ],
-              onSelected: (key) => setState(() => hiddenColumns.contains(key) ? hiddenColumns.remove(key) : hiddenColumns.add(key)),
-            ),
-            const SizedBox(width: 8),
-            TextButton.icon(
-              onPressed: () => _download(const ListToCsvConverter().convert([columns, ...rows]), 'data.csv', 'text/csv'),
-              icon: Icon(Icons.download, size: 14, color: theme.AppColors.amber),
-              label: Text('CSV', style: monoStyle.copyWith(color: theme.AppColors.amber, fontSize: 12)),
-            ),
-            TextButton.icon(
-              onPressed: () => _download(jsonEncode({'columns': columns, 'rows': rows}), 'data.json', 'application/json'),
-              icon: Icon(Icons.download, size: 14, color: theme.AppColors.amber),
-              label: Text('JSON', style: monoStyle.copyWith(color: theme.AppColors.amber, fontSize: 12)),
-            ),
-          ]),
+              PopupMenuButton<String>(
+                tooltip: 'Columns',
+                icon: Icon(Icons.view_column, color: theme.AppColors.grey, size: 20),
+                padding: EdgeInsets.zero,
+                itemBuilder: (context) => [
+                  for (final f in fields) CheckedPopupMenuItem(value: f.jsonKey, checked: !hiddenColumns.contains(f.jsonKey), child: Text(f.label, style: monoStyle.copyWith(fontSize: 12))),
+                ],
+                onSelected: (key) => setState(() => hiddenColumns.contains(key) ? hiddenColumns.remove(key) : hiddenColumns.add(key)),
+              ),
+              TextButton.icon(
+                onPressed: () => _download(const ListToCsvConverter().convert([columns, ...rows]), 'data.csv', 'text/csv'),
+                icon: Icon(Icons.download, size: 14, color: theme.AppColors.amber),
+                label: Text('CSV', style: monoStyle.copyWith(color: theme.AppColors.amber, fontSize: 12)),
+              ),
+              TextButton.icon(
+                onPressed: () => _download(jsonEncode({'columns': columns, 'rows': rows}), 'data.json', 'application/json'),
+                icon: Icon(Icons.download, size: 14, color: theme.AppColors.amber),
+                label: Text('JSON', style: monoStyle.copyWith(color: theme.AppColors.amber, fontSize: 12)),
+              ),
+            ],
+          ),
         ),
         Expanded(
+          // Horizontal scroll for wide column sets, wrapping a Column whose
+          // ListView.builder below is what actually gives vertical scroll --
+          // this is the piece the old sidebar table was missing entirely.
           child: SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: SizedBox(
@@ -1080,11 +1242,13 @@ class _DataTableScreenState extends ConsumerState<DataTableScreen> {
                 children: [
                   _headerRow(columns),
                   Expanded(
-                    child: ListView.builder(
-                      itemCount: rows.length,
-                      itemExtent: 30,
-                      itemBuilder: (context, i) => _dataRow(rows[i], i),
-                    ),
+                    child: rows.isEmpty
+                        ? Center(child: Text('NO DATA AVAILABLE', style: monoStyle.copyWith(fontSize: 11, color: theme.AppColors.greyDim)))
+                        : ListView.builder(
+                            itemCount: rows.length,
+                            itemExtent: 30,
+                            itemBuilder: (context, i) => _dataRow(rows[i], i),
+                          ),
                   ),
                 ],
               ),
@@ -1149,5 +1313,28 @@ class _DataTableScreenState extends ConsumerState<DataTableScreen> {
       ..download = filename;
     anchor.click();
     web.URL.revokeObjectURL(url);
+  }
+}
+
+/// Standalone /explore/data route -- now just a Scaffold shell around
+/// _RawDataTableView with a back button wired to the dashboard, so the page
+/// and the split-screen sidebar can never drift out of sync.
+class DataTableScreen extends ConsumerWidget {
+  const DataTableScreen({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final appState = ref.watch(appStateProvider);
+    final router = ref.watch(routerProvider);
+    if (appState.location == null) return const SizedBox.shrink();
+    return Scaffold(
+      backgroundColor: bgColor,
+      body: SafeArea(
+        child: _RawDataTableView(
+          mode: appState.mode,
+          onBack: () => ref.read(appStateProvider.notifier).goToDashboard(router),
+        ),
+      ),
+    );
   }
 }

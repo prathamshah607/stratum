@@ -435,20 +435,6 @@ final fullFieldRegistryProvider = Provider<Map<ModeType, List<FieldSpec>>>((ref)
 });
 
 // Full HistoricalDaily registry -- mirrors the WeatherDaily pattern above.
-// NOTE: field names here follow Open-Meteo's documented Historical Weather
-// API daily aggregation parameters (same naming convention the package
-// already uses for WeatherDaily). If your installed open_meteo version
-// doesn't export `HistoricalDaily`, this is the one spot in the file that
-// won't compile -- swap `HistoricalDaily.x` for whatever the package's
-// equivalent daily-historical enum is actually called and the rest of the
-// wiring (jsonKey, dataProvider, activeFieldsProvider) needs no changes.
-//
-// This registry -- and defaulting Historical mode to it -- is the actual
-// fix for "historical data not loading": requesting 5-10 years of HOURLY
-// data across 5-7 primary fields was almost certainly hitting the Archive
-// API's per-request data-volume ceiling, which is why the heatmap's day
-// cells were coming back empty. Daily is >20x fewer data points for the
-// same calendar coverage.
 final fullHistoricalDailyFieldsProvider = Provider<List<FieldSpec>>((ref) {
   return [
     FieldSpec(enumKey: HistoricalDaily.weather_code, label: 'Weather Code', mode: ModeType.historical, fixedUnit: '', chart: ChartKind.line, color: Colors.purple),
@@ -477,12 +463,6 @@ final fullHistoricalDailyFieldsProvider = Provider<List<FieldSpec>>((ref) {
 /// out of sync the way Weather's daily toggle previously could.
 final resolvedFullFieldsProvider = Provider.family<List<FieldSpec>, ModeType>((ref, mode) {
   final appState = ref.watch(appStateProvider);
-  // Past a 1-year window, the actual fetch is forced to daily regardless of
-  // what the toggle last showed (see isLongRange / _ModeView) -- this must
-  // mirror that exactly, or activeFieldsProvider hands out hourly field
-  // keys while the request itself goes out as daily, and every hourly-only
-  // key (e.g. relative_humidity_2m, which has no WeatherDaily equivalent by
-  // that exact name) blows up the dataProvider's firstWhere lookup.
   final longRange = isLongRange(appState.rangeStart, appState.rangeEnd);
   final weatherResolution = longRange ? TemporalResolution.daily : appState.weatherResolution;
   final historicalResolution = longRange ? TemporalResolution.daily : appState.historicalResolution;
@@ -515,6 +495,15 @@ class AppState {
   final TemporalResolution weatherResolution;
   final TemporalResolution historicalResolution;
 
+  /// False until the user has explicitly dragged either the START or END
+  /// field in the app-bar date picker. While false, switching into
+  /// Historical or Climate mode is allowed to move the master window to a
+  /// sensible mode-specific default (3Y back for Historical archive data,
+  /// 3Y forward for the Climate/CMIP-6 forecast) -- see
+  /// AppStateNotifier.setMode. Once the user has touched a field directly,
+  /// their choice sticks across every mode switch from then on.
+  final bool rangeManuallySet;
+
   AppState({
     this.location,
     this.mode = ModeType.weather,
@@ -523,6 +512,7 @@ class AppState {
     this.extraFields = const {},
     this.weatherResolution = TemporalResolution.hourly,
     this.historicalResolution = TemporalResolution.daily,
+    this.rangeManuallySet = false,
   })  : rangeStart = rangeStart ?? DateTime.now().subtract(const Duration(days: 30)),
         rangeEnd = rangeEnd ?? DateTime.now().add(const Duration(days: 14));
 
@@ -534,6 +524,7 @@ class AppState {
     Map<ModeType, List<String>>? extraFields,
     TemporalResolution? weatherResolution,
     TemporalResolution? historicalResolution,
+    bool? rangeManuallySet,
   }) =>
       AppState(
         location: location ?? this.location,
@@ -543,6 +534,7 @@ class AppState {
         extraFields: extraFields ?? this.extraFields,
         weatherResolution: weatherResolution ?? this.weatherResolution,
         historicalResolution: historicalResolution ?? this.historicalResolution,
+        rangeManuallySet: rangeManuallySet ?? this.rangeManuallySet,
       );
 }
 
@@ -561,6 +553,7 @@ class AppStateNotifier extends Notifier<AppState> {
       extraFields: state.extraFields,
       weatherResolution: TemporalResolution.values.firstWhere((r) => r.name == q['wres'], orElse: () => TemporalResolution.hourly),
       historicalResolution: TemporalResolution.values.firstWhere((r) => r.name == q['hres'], orElse: () => TemporalResolution.daily),
+      rangeManuallySet: q['rset'] == 'true',
     );
     if (q['units'] == 'imperial') {
       ref.read(unitSystemProvider.notifier).state = UnitSystem.imperial;
@@ -578,6 +571,7 @@ class AppStateNotifier extends Notifier<AppState> {
       'units': units.key,
       'wres': state.weatherResolution.name,
       'hres': state.historicalResolution.name,
+      'rset': state.rangeManuallySet.toString(),
     };
     final query = params.entries.map((e) => '${e.key}=${Uri.encodeComponent(e.value)}').join('&');
     router.go('$path?$query');
@@ -595,23 +589,40 @@ class AppStateNotifier extends Notifier<AppState> {
     _pushToUrl(router);
   }
 
+  /// Historical defaults its window to the last 3 years, and Climate
+  /// (CMIP-6) to the next 3 years, the first time the user opens that tab
+  /// -- but only while the user hasn't touched the START/END fields
+  /// themselves (see AppState.rangeManuallySet). Once they have, their
+  /// choice sticks across every mode switch from then on.
   void setMode(ModeType mode, GoRouter router) {
-    state = state.copyWith(mode: mode);
+    var next = state.copyWith(mode: mode);
+    if (!state.rangeManuallySet) {
+      final now = DateTime.now();
+      if (mode == ModeType.historical) {
+        next = next.copyWith(rangeStart: now.subtract(const Duration(days: 365 * 3)), rangeEnd: now);
+      } else if (mode == ModeType.climate) {
+        next = next.copyWith(rangeStart: now, rangeEnd: now.add(const Duration(days: 365 * 3)));
+      }
+    }
+    state = next;
     _pushToUrl(router);
   }
 
   /// User edited the START field in the app-bar date range. Guards against
-  /// the range inverting if they pick a start after the current end.
+  /// the range inverting if they pick a start after the current end, and
+  /// marks the range as manually chosen so mode switches never override it
+  /// again.
   void setRangeStart(DateTime start, GoRouter router) {
     final end = start.isAfter(state.rangeEnd) ? start : state.rangeEnd;
-    state = state.copyWith(rangeStart: start, rangeEnd: end);
+    state = state.copyWith(rangeStart: start, rangeEnd: end, rangeManuallySet: true);
     _pushToUrl(router);
   }
 
-  /// User edited the END field. Same invert-guard as setRangeStart.
+  /// User edited the END field. Same invert-guard and manual-flag as
+  /// setRangeStart.
   void setRangeEnd(DateTime end, GoRouter router) {
     final start = end.isBefore(state.rangeStart) ? end : state.rangeStart;
-    state = state.copyWith(rangeStart: start, rangeEnd: end);
+    state = state.copyWith(rangeStart: start, rangeEnd: end, rangeManuallySet: true);
     _pushToUrl(router);
   }
 
@@ -691,11 +702,6 @@ final dataProvider = FutureProvider.family<Map<String, dynamic>, FetchParams>((r
     case ModeType.weather:
       final api = WeatherApi(temperatureUnit: units.temperature, windspeedUnit: units.windspeed, precipitationUnit: units.precipitation);
       final locations = {OpenMeteoLocation(latitude: lat, longitude: lon)};
-      // ForecastStrip needs daily (weather_code/hi/lo) for its day cards and
-      // hourly (weather_code/temp) for the inline per-day expand, regardless
-      // of which resolution the HOURLY/DAILY toggle currently shows in the
-      // metric panels below -- so both are always requested together in the
-      // same call rather than switching between them.
       final daily = params.resolution == TemporalResolution.daily
           ? params.fieldKeys.map((k) => WeatherDaily.values.firstWhere((v) => v.name == k)).toSet()
           : {WeatherDaily.weather_code, WeatherDaily.temperature_2m_max, WeatherDaily.temperature_2m_min};
@@ -710,9 +716,6 @@ final dataProvider = FutureProvider.family<Map<String, dynamic>, FetchParams>((r
         forecastDays: forecastDaysTo(end).clamp(0, 16),
       );
     case ModeType.historical:
-      // Archive API is past-only, and defaults to DAILY resolution (see
-      // AppState.historicalResolution) -- hourly is an explicit opt-in via
-      // the HOURLY/DAILY toggle above the panels.
       final api = HistoricalApi(temperatureUnit: units.temperature, windspeedUnit: units.windspeed, precipitationUnit: units.precipitation);
       final histEnd = end.isAfter(now) ? now : end;
       final histStart = start.isAfter(histEnd) ? histEnd : start;
@@ -724,8 +727,6 @@ final dataProvider = FutureProvider.family<Map<String, dynamic>, FetchParams>((r
       final hourly = params.fieldKeys.map((k) => HistoricalHourly.values.firstWhere((v) => v.name == k)).toSet();
       return api.requestJson(locations: locations, hourly: hourly);
     case ModeType.climate:
-      // ClimateApi requires a model set at construction (not per-request).
-      // Range here is a FUTURE window (climate projections), not a past one.
       final api = ClimateApi(models: {OpenMeteoModel.MRI_AGCM3_2_S}, temperatureUnit: units.temperature, windspeedUnit: units.windspeed, precipitationUnit: units.precipitation);
       final daily = params.fieldKeys.map((k) => ClimateDaily.values.firstWhere((v) => v.name == k)).toSet();
       final climStart = start.isBefore(now) ? now : start;
@@ -741,14 +742,10 @@ final dataProvider = FutureProvider.family<Map<String, dynamic>, FetchParams>((r
       final hourly = params.fieldKeys.map((k) => AirQualityHourly.values.firstWhere((v) => v.name == k)).toSet();
       return api.requestJson(locations: {OpenMeteoLocation(latitude: lat, longitude: lon)}, hourly: hourly, pastDays: pastDaysFrom(start).clamp(0, 92));
     case ModeType.flood:
-      // ensemble:true is what makes river_discharge_mean/min/max/p25/p75
-      // meaningful -- without it those aggregation fields are degenerate
-      // (a single deterministic run has no spread to aggregate).
       final api = FloodApi(ensemble: true);
       final daily = params.fieldKeys.map((k) => FloodDaily.values.firstWhere((v) => v.name == k)).toSet();
       return api.requestJson(locations: {OpenMeteoLocation(latitude: lat, longitude: lon)}, daily: daily, pastDays: pastDaysFrom(start).clamp(0, 366));
     case ModeType.ensemble:
-      // EnsembleApi also requires a model set at construction.
       final api = EnsembleApi(models: {OpenMeteoModel.icon_seamless}, temperatureUnit: units.temperature, windspeedUnit: units.windspeed, precipitationUnit: units.precipitation);
       final hourly = params.fieldKeys.map((k) => EnsembleHourly.values.firstWhere((v) => v.name == k)).toSet();
       return api.requestJson(locations: {OpenMeteoLocation(latitude: lat, longitude: lon)}, hourly: hourly, pastDays: pastDaysFrom(start).clamp(0, 92));
@@ -788,10 +785,6 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: '/explore',
         builder: (context, state) {
-          // syncFromUri mutates appStateProvider's state. Calling it directly
-          // here runs it mid-build (GoRouter builds this during Flutter's
-          // build phase), which Riverpod forbids. Defer it a microtask so it
-          // runs right after the current build finishes.
           Future.microtask(() => ref.read(appStateProvider.notifier).syncFromUri(state.uri));
           return DashboardScreen();
         },

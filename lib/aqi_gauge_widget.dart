@@ -20,6 +20,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'theme.dart';
+import 'widgets.dart' show planAxisLabels, indianFullDateTime;
 
 class AqiGauge extends StatelessWidget {
   final double? current;
@@ -151,66 +152,56 @@ class _TrendChart extends StatelessWidget {
   final List<double> history;
   final List<DateTime>? times;
   final Color color;
-  const _TrendChart(
-      {required this.history, required this.times, required this.color});
+  const _TrendChart({required this.history, required this.times, required this.color});
 
   @override
   Widget build(BuildContext context) {
     final hasTimes = times != null && times!.length >= history.length;
-    return LineChart(LineChartData(
-      gridData: FlGridData(
-          show: true,
-          getDrawingHorizontalLine: (_) =>
-              FlLine(color: AppColors.border, strokeWidth: 0.5)),
-      titlesData: FlTitlesData(
-        topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-        rightTitles:
-            const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-        leftTitles: AxisTitles(
+    return LayoutBuilder(builder: (context, constraints) {
+      final t = hasTimes ? times!.sublist(0, history.length) : null;
+      final plan = t != null ? planAxisLabels(t, constraints.maxWidth) : null;
+      return LineChart(LineChartData(
+        gridData: FlGridData(show: true, getDrawingHorizontalLine: (_) => FlLine(color: AppColors.border, strokeWidth: 0.5)),
+        titlesData: FlTitlesData(
+          topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+          rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
+          leftTitles: AxisTitles(sideTitles: SideTitles(showTitles: true, reservedSize: 32, getTitlesWidget: (v, m) => Text(v.toStringAsFixed(0), style: monoStyle.copyWith(fontSize: 9, color: AppColors.grey)))),
+          bottomTitles: AxisTitles(
             sideTitles: SideTitles(
-                showTitles: true,
-                reservedSize: 32,
-                getTitlesWidget: (v, m) => Text(v.toStringAsFixed(0),
-                    style: monoStyle.copyWith(
-                        fontSize: 9, color: AppColors.grey)))),
-        bottomTitles: AxisTitles(
-          sideTitles: SideTitles(
-            showTitles: hasTimes,
-            reservedSize: 22,
-            interval: hasTimes
-                ? (history.length / 4)
-                    .ceilToDouble()
-                    .clamp(1, history.length.toDouble())
-                : null,
-            getTitlesWidget: (v, m) {
-              if (!hasTimes) return const SizedBox.shrink();
-              final i = v.round();
-              if (i < 0 || i >= times!.length) return const SizedBox.shrink();
-              final d = times![i];
-              return Padding(
-                  padding: const EdgeInsets.only(top: 3),
-                  child: Text(
-                      '${d.month}/${d.day} ${d.hour.toString().padLeft(2, '0')}h',
-                      style: monoStyle.copyWith(
-                          fontSize: 8, color: AppColors.grey)));
-            },
+              showTitles: plan != null,
+              reservedSize: 22,
+              interval: plan?.interval,
+              getTitlesWidget: (v, m) {
+                if (plan == null || t == null) return const SizedBox.shrink();
+                final i = v.round();
+                if (i < 0 || i >= t.length) return const SizedBox.shrink();
+                return Padding(padding: const EdgeInsets.only(top: 3), child: Text(plan.axisFormat(t[i]), style: monoStyle.copyWith(fontSize: 8, color: AppColors.grey)));
+              },
+            ),
           ),
         ),
-      ),
-      borderData: FlBorderData(show: false),
-      lineBarsData: [
-        LineChartBarData(
-          spots: [
-            for (var i = 0; i < history.length; i++)
-              FlSpot(i.toDouble(), history[i])
-          ],
-          isCurved: false,
-          barWidth: 1.4,
-          color: color,
-          dotData: const FlDotData(show: false),
+        borderData: FlBorderData(show: false),
+        lineTouchData: LineTouchData(
+          touchTooltipData: LineTouchTooltipData(
+            getTooltipItems: (spots) => spots.map((s) {
+              final i = s.x.round();
+              final dateLabel = (plan != null && t != null && i >= 0 && i < t.length) ? plan.tooltipFormat(t[i]) : '';
+              final valueLabel = 'AQI ${s.y.toStringAsFixed(0)}';
+              return LineTooltipItem(dateLabel.isEmpty ? valueLabel : '$dateLabel\n$valueLabel', monoStyle.copyWith(fontSize: 11, color: AppColors.white, fontWeight: FontWeight.bold));
+            }).toList(),
+          ),
         ),
-      ],
-    ));
+        lineBarsData: [
+          LineChartBarData(
+            spots: [for (var i = 0; i < history.length; i++) FlSpot(i.toDouble(), history[i])],
+            isCurved: false,
+            barWidth: 1.4,
+            color: color,
+            dotData: const FlDotData(show: false),
+          ),
+        ],
+      ));
+    });
   }
 }
 

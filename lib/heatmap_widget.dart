@@ -59,9 +59,9 @@ class _CalendarHeatmapState extends State<CalendarHeatmap> {
       final v = byYear[year]?[day];
       if (v != null) {
         final date = DateTime.utc(year, 1, 1).add(Duration(days: day - 1));
-        final mm = date.month.toString().padLeft(2, '0');
         final dd = date.day.toString().padLeft(2, '0');
-        text = '${date.year}-$mm-$dd  ${v.toStringAsFixed(1)}${widget.unit}';
+        final mm = date.month.toString().padLeft(2, '0');
+        text = '$dd/$mm/${date.year}  ${v.toStringAsFixed(1)}${widget.unit}';
       }
     }
     if (text != _hoverText) setState(() => _hoverText = text);
@@ -131,6 +131,7 @@ class _CalendarHeatmapState extends State<CalendarHeatmap> {
                     child: RepaintBoundary(
                       child: CustomPaint(
                         painter: _HeatmapPainter(
+                          label: widget.label,
                           years: years,
                           byYear: byYear,
                           mean: mean,
@@ -153,10 +154,17 @@ class _CalendarHeatmapState extends State<CalendarHeatmap> {
   }
 
   Widget _legend() {
+    final isPrecip = widget.label.toLowerCase().contains('precipitation');
+    final isWind = widget.label.toLowerCase().contains('wind');
+    
+    final Color lowColor = isPrecip ? const Color(0xFF007AFF) : (isWind ? AppColors.border : AppColors.green);
+    final Color midColor = isPrecip ? AppColors.white : (isWind ? const Color(0xFF008800) : AppColors.amber);
+    final Color highColor = isPrecip ? AppColors.red : (isWind ? AppColors.green : AppColors.red);
+
     return Row(children: [
-      Text('LOW', style: monoStyle.copyWith(fontSize: 9, color: AppColors.green)),
-      Container(width: 40, height: 8, margin: const EdgeInsets.symmetric(horizontal: 4), decoration: const BoxDecoration(gradient: LinearGradient(colors: [AppColors.green, AppColors.amber, AppColors.red]))),
-      Text('HIGH', style: monoStyle.copyWith(fontSize: 9, color: AppColors.red)),
+      Text('LOW', style: monoStyle.copyWith(fontSize: 9, color: lowColor)),
+      Container(width: 40, height: 8, margin: const EdgeInsets.symmetric(horizontal: 4), decoration: BoxDecoration(gradient: LinearGradient(colors: [lowColor, midColor, highColor]))),
+      Text('HIGH', style: monoStyle.copyWith(fontSize: 9, color: highColor)),
     ]);
   }
 }
@@ -173,6 +181,7 @@ class _HeatmapPainter extends CustomPainter {
   final double gap;
   final double leftLabel;
   final double topHeader;
+  final String label;
 
   _HeatmapPainter({
     required this.years,
@@ -183,6 +192,7 @@ class _HeatmapPainter extends CustomPainter {
     required this.gap,
     required this.leftLabel,
     required this.topHeader,
+    required this.label,
   });
 
   static const _months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
@@ -191,6 +201,9 @@ class _HeatmapPainter extends CustomPainter {
   Color _colorFor(double v) {
     if (maxDev == 0) return AppColors.amber;
     final t = ((v - mean) / maxDev + 1) / 2; // map -1..1 -> 0..1
+    final l = label.toLowerCase();
+    if (l.contains('precipitation')) return precipDivergingColor(t);
+    if (l.contains('wind')) return windDivergingColor(t);
     return divergingColor(t);
   }
 
@@ -232,5 +245,5 @@ class _HeatmapPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(covariant _HeatmapPainter oldDelegate) =>
-      oldDelegate.years != years || oldDelegate.byYear != byYear || oldDelegate.mean != mean || oldDelegate.maxDev != maxDev;
+      oldDelegate.years != years || oldDelegate.byYear != byYear || oldDelegate.mean != mean || oldDelegate.maxDev != maxDev || oldDelegate.label != label;
 }

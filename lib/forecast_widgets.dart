@@ -11,11 +11,20 @@
 //   supplied.
 // - ForecastStrip: the 14-day-outlook + tap-to-expand-hourly view, built
 //   from WMO weather codes (see weather_codes.dart) with Material icons.
+//
+// AXIS FIX: the mini chart's bottom labels used to be a fixed "roughly 3
+// labels, always MM/DD HH:mm" rule -- on a narrow panel that still
+// overlapped, and on long Historical/Climate ranges every label printed
+// the same "0:00" over and over. Now it uses the same planAxisLabels()
+// helper as StandardLineChart/StandardBarChart (widgets.dart), measured
+// against the chart's real width via LayoutBuilder, so labels are always
+// legible and never repeat.
 
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'theme.dart';
 import 'weather_codes.dart';
+import 'widgets.dart' show planAxisLabels, AxisLabelPlan, indianFullDateTime;
 
 // ---------------------------------------------------------------------------
 // MetricPanel
@@ -75,7 +84,9 @@ class MetricPanel extends StatelessWidget {
                 Expanded(
                   child: values.isEmpty
                       ? Center(child: Text('NO DATA AVAILABLE', style: monoStyle.copyWith(fontSize: 11, color: AppColors.greyDim)))
-                      : (isBar ? _bar() : _line()),
+                      : LayoutBuilder(builder: (context, constraints) {
+                          return isBar ? _bar(constraints.maxWidth) : _line(constraints.maxWidth);
+                        }),
                 ),
               ],
             ),
@@ -95,37 +106,50 @@ class MetricPanel extends StatelessWidget {
     );
   }
 
-  AxisTitles _bottomTitles() {
+  AxisLabelPlan? _plan(double width) {
+    final t = times;
+    return (t != null && t.isNotEmpty) ? planAxisLabels(t, width) : null;
+  }
+
+  AxisTitles _bottomTitlesFor(AxisLabelPlan? plan) {
+    final t = times;
     return AxisTitles(
       sideTitles: SideTitles(
-        showTitles: times != null && times!.isNotEmpty,
+        showTitles: plan != null,
         reservedSize: 20,
-        interval: times != null && times!.length > 1 ? (times!.length / 3).ceilToDouble().clamp(1, times!.length.toDouble()) : null,
+        interval: plan?.interval,
         getTitlesWidget: (v, m) {
-          final t = times;
-          if (t == null || t.isEmpty) return const SizedBox.shrink();
+          if (plan == null || t == null) return const SizedBox.shrink();
           final i = v.round();
           if (i < 0 || i >= t.length) return const SizedBox.shrink();
-          final d = t[i];
-          return Padding(
-            padding: const EdgeInsets.only(top: 2),
-            child: Text('${d.month}/${d.day} ${d.hour.toString().padLeft(2, '0')}h', style: monoStyle.copyWith(fontSize: 8, color: AppColors.grey)),
-          );
+          return Padding(padding: const EdgeInsets.only(top: 2), child: Text(plan.axisFormat(t[i]), style: monoStyle.copyWith(fontSize: 8, color: AppColors.grey)));
         },
       ),
     );
   }
 
-  Widget _line() {
+  LineTooltipItem? _tooltipItem(LineBarSpot s, AxisLabelPlan? plan) {
+    final t = times;
+    final i = s.x.round();
+    final dateLabel = (plan != null && t != null && i >= 0 && i < t.length) ? plan.tooltipFormat(t[i]) : '';
+    final valueLabel = '${s.y.toStringAsFixed(1)}$unit';
+    return LineTooltipItem(dateLabel.isEmpty ? valueLabel : '$dateLabel\n$valueLabel', monoStyle.copyWith(fontSize: 11, color: AppColors.white, fontWeight: FontWeight.bold));
+  }
+
+  Widget _line(double width) {
+    final plan = _plan(width);
     return LineChart(LineChartData(
       gridData: FlGridData(show: true, getDrawingHorizontalLine: (_) => FlLine(color: AppColors.border, strokeWidth: 0.5)),
       titlesData: FlTitlesData(
         topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
         rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
         leftTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-        bottomTitles: _bottomTitles(),
+        bottomTitles: _bottomTitlesFor(plan),
       ),
       borderData: FlBorderData(show: false),
+      lineTouchData: LineTouchData(
+        touchTooltipData: LineTouchTooltipData(getTooltipItems: (spots) => spots.map((s) => _tooltipItem(s, plan)).toList()),
+      ),
       lineBarsData: [
         LineChartBarData(
           spots: [for (var i = 0; i < values.length; i++) FlSpot(i.toDouble(), values[i])],
@@ -138,16 +162,28 @@ class MetricPanel extends StatelessWidget {
     ));
   }
 
-  Widget _bar() {
+  Widget _bar(double width) {
+    final plan = _plan(width);
     return BarChart(BarChartData(
       gridData: FlGridData(show: true, getDrawingHorizontalLine: (_) => FlLine(color: AppColors.border, strokeWidth: 0.5)),
       titlesData: FlTitlesData(
         topTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
         rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
         leftTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
-        bottomTitles: _bottomTitles(),
+        bottomTitles: _bottomTitlesFor(plan),
       ),
       borderData: FlBorderData(show: false),
+      barTouchData: BarTouchData(
+        touchTooltipData: BarTouchTooltipData(
+          getTooltipItem: (group, groupIndex, rod, rodIndex) {
+            final t = times;
+            final i = group.x.toInt();
+            final dateLabel = (plan != null && t != null && i >= 0 && i < t.length) ? plan.tooltipFormat(t[i]) : '';
+            final valueLabel = '${rod.toY.toStringAsFixed(1)}$unit';
+            return BarTooltipItem(dateLabel.isEmpty ? valueLabel : '$dateLabel\n$valueLabel', monoStyle.copyWith(fontSize: 11, color: AppColors.white, fontWeight: FontWeight.bold));
+          },
+        ),
+      ),
       barGroups: [for (var i = 0; i < values.length; i++) BarChartGroupData(x: i, barRods: [BarChartRodData(toY: values[i], color: AppColors.amber, width: 3)])],
     ));
   }

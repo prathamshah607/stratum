@@ -54,3 +54,19 @@ Color divergingColor(double t) {
   if (clamped < 0.5) return Color.lerp(AppColors.green, AppColors.amber, clamped / 0.5)!;
   return Color.lerp(AppColors.amber, AppColors.red, (clamped - 0.5) / 0.5)!;
 }
+
+/// Precipitation: Blue -> White -> Red
+Color precipDivergingColor(double t) {
+  final clamped = t.clamp(0.0, 1.0);
+  const blue = Color(0xFF007AFF);
+  if (clamped < 0.5) return Color.lerp(blue, AppColors.white, clamped / 0.5)!;
+  return Color.lerp(AppColors.white, AppColors.red, (clamped - 0.5) / 0.5)!;
+}
+
+/// Wind: Dark Grey -> Mid Green -> Bright Green
+Color windDivergingColor(double t) {
+  final clamped = t.clamp(0.0, 1.0);
+  const midGreen = Color(0xFF008800);
+  if (clamped < 0.5) return Color.lerp(AppColors.border, midGreen, clamped / 0.5)!;
+  return Color.lerp(midGreen, AppColors.green, (clamped - 0.5) / 0.5)!;
+}

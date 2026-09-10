@@ -14,6 +14,7 @@
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'theme.dart';
+import 'widgets.dart' show planAxisLabels, AxisLabelPlan, indianFullDateTime;
 
 /// Scans a series map for `<baseKey>_memberNN` keys and returns each
 /// member's value list, null-filtered per member, in member-index order.
@@ -99,13 +100,13 @@ class FanChart extends StatelessWidget {
             ),
           ]),
           const SizedBox(height: 8),
-          Expanded(child: _chart(mean, lo, hi, usable, length)),
+          Expanded(child: LayoutBuilder(builder: (context, constraints) => _chart(mean, lo, hi, usable, length, constraints.maxWidth))),
         ],
       ),
     );
   }
 
-  Widget _chart(List<double> mean, List<double> lo, List<double> hi, List<List<double>> usable, int length) {
+  Widget _chart(List<double> mean, List<double> lo, List<double> hi, List<List<double>> usable, int length, double width) {
     final memberLines = usable.length <= 12
         ? [
             for (final m in usable)
@@ -144,8 +145,11 @@ class FanChart extends StatelessWidget {
     final bars = [...memberLines, loLine, hiLine, meanLine];
     final loIdx = bars.length - 3;
     final hiIdx = bars.length - 2;
+    final meanIdx = bars.length - 1;
 
     final hasTimes = times != null && times!.length >= length && length > 0;
+    final t = hasTimes ? times!.sublist(0, length) : null;
+    final plan = t != null ? planAxisLabels(t, width) : null;
 
     return LineChart(LineChartData(
       gridData: FlGridData(show: true, getDrawingHorizontalLine: (_) => FlLine(color: AppColors.border, strokeWidth: 0.5)),
@@ -154,15 +158,14 @@ class FanChart extends StatelessWidget {
         rightTitles: const AxisTitles(sideTitles: SideTitles(showTitles: false)),
         bottomTitles: AxisTitles(
           sideTitles: SideTitles(
-            showTitles: hasTimes,
-            reservedSize: 22,
-            interval: hasTimes ? (length / 4).ceilToDouble().clamp(1, length.toDouble()) : null,
+            showTitles: plan != null,
+            reservedSize: 24,
+            interval: plan?.interval,
             getTitlesWidget: (v, m) {
-              if (!hasTimes) return const SizedBox.shrink();
+              if (plan == null || t == null) return const SizedBox.shrink();
               final i = v.round();
-              if (i < 0 || i >= times!.length) return const SizedBox.shrink();
-              final d = times![i];
-              return Padding(padding: const EdgeInsets.only(top: 3), child: Text('${d.month}/${d.day} ${d.hour.toString().padLeft(2, '0')}h', style: monoStyle.copyWith(fontSize: 8, color: AppColors.grey)));
+              if (i < 0 || i >= t.length) return const SizedBox.shrink();
+              return Padding(padding: const EdgeInsets.only(top: 3), child: Text(plan.axisFormat(t[i]), style: monoStyle.copyWith(fontSize: 8, color: AppColors.grey)));
             },
           ),
         ),
@@ -170,6 +173,18 @@ class FanChart extends StatelessWidget {
       ),
       borderData: FlBorderData(show: false),
       betweenBarsData: [BetweenBarsData(fromIndex: loIdx, toIndex: hiIdx, color: AppColors.amberDim.withOpacity(0.18))],
+      lineTouchData: LineTouchData(
+        touchSpotThreshold: 20,
+        touchTooltipData: LineTouchTooltipData(
+          getTooltipItems: (spots) => spots.map((s) {
+            if (s.barIndex != meanIdx) return null; // only tooltip the mean line
+            final i = s.x.round();
+            final dateLabel = (plan != null && t != null && i >= 0 && i < t.length) ? plan.tooltipFormat(t[i]) : '';
+            final valueLabel = 'MEAN ${s.y.toStringAsFixed(1)}$unit';
+            return LineTooltipItem(dateLabel.isEmpty ? valueLabel : '$dateLabel\n$valueLabel', monoStyle.copyWith(fontSize: 11, color: AppColors.white, fontWeight: FontWeight.bold));
+          }).toList(),
+        ),
+      ),
       lineBarsData: bars,
     ));
   }
