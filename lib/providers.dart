@@ -460,31 +460,42 @@ final fullHistoricalDailyFieldsProvider = Provider<List<FieldSpec>>((ref) {
   ];
 });
 
+/// THE single resolveRange() call for a given mode -- everything that needs
+/// the clamped window/resolution (resolvedFullFieldsProvider below, AND
+/// _ModeView / _RawDataTableView in screens.dart) reads THIS instead of
+/// calling resolveRange() itself. Two independent call sites computing
+/// their own "now" could round to different UTC days right at midnight and
+/// disagree on daily-vs-hourly -- resolvedFullFieldsProvider would then
+/// hand back WeatherDaily field keys while _ModeView requested hourly (or
+/// vice versa), and `WeatherHourly.values.firstWhere((v) => v.name == k)`
+/// in dataProvider throws for every key, which FutureProvider swallows into
+/// an empty result -- surfacing as every panel silently reading "NOT
+/// AVAILABLE" instead of a visible error.
+final resolvedRangeProvider = Provider.family<ResolvedRange, ModeType>((ref, mode) {
+  final appState = ref.watch(appStateProvider);
+  final rawResolution = mode == ModeType.weather
+      ? appState.weatherResolution
+      : mode == ModeType.historical
+          ? appState.historicalResolution
+          : TemporalResolution.hourly;
+  return resolveRange(mode: mode, requestedStart: appState.rangeStart, requestedEnd: appState.rangeEnd, requestedResolution: rawResolution);
+});
+
 /// Resolves the correct "full" field list for a mode given its current
 /// resolution toggle (Weather/Historical only -- everything else has one
 /// fixed enum set). Used by BOTH activeFieldsProvider (what's fetched) and
 /// the "SELECT METRICS" picker (what's offered), so they can never drift
 /// out of sync the way Weather's daily toggle previously could.
 final resolvedFullFieldsProvider = Provider.family<List<FieldSpec>, ModeType>((ref, mode) {
-  final appState = ref.watch(appStateProvider);
-  final longRange = isLongRange(appState.rangeStart, appState.rangeEnd);
-  final weatherResolution = longRange ? TemporalResolution.daily : appState.weatherResolution;
-  final historicalResolution = longRange ? TemporalResolution.daily : appState.historicalResolution;
-  if (mode == ModeType.weather && weatherResolution == TemporalResolution.daily) {
+  final resolved = ref.watch(resolvedRangeProvider(mode));
+  if (mode == ModeType.weather && resolved.resolution == TemporalResolution.daily) {
     return ref.watch(fullWeatherDailyFieldsProvider);
   }
-  if (mode == ModeType.historical && historicalResolution == TemporalResolution.daily) {
+  if (mode == ModeType.historical && resolved.resolution == TemporalResolution.daily) {
     return ref.watch(fullHistoricalDailyFieldsProvider);
   }
   return ref.watch(fullFieldRegistryProvider)[mode] ?? [];
 });
-
-/// True once the master START/END window exceeds one year. Past this,
-/// hourly requests get enormous (chart lag, and for Historical, past the
-/// Archive API's realistic per-request volume) -- so callers should hide
-/// the HOURLY option entirely and force daily regardless of what the
-/// toggle was last set to.
-bool isLongRange(DateTime start, DateTime end) => end.difference(start).inDays.abs() > 365;
 
 // ---------------------------------------------------------------------------
 // App state: location / mode / range (incl. custom window) / user-added
@@ -517,8 +528,8 @@ class AppState {
     this.weatherResolution = TemporalResolution.hourly,
     this.historicalResolution = TemporalResolution.daily,
     this.rangeManuallySet = false,
-  })  : rangeStart = rangeStart ?? DateTime.now().subtract(const Duration(days: 30)),
-        rangeEnd = rangeEnd ?? DateTime.now().add(const Duration(days: 14));
+  })  : rangeStart = rangeStart ?? DateTime.now().toUtc().subtract(const Duration(days: 30)),
+        rangeEnd = rangeEnd ?? DateTime.now().toUtc().add(const Duration(days: 14));
 
   AppState copyWith({
     LocationParams? location,
@@ -601,7 +612,7 @@ class AppStateNotifier extends Notifier<AppState> {
   void setMode(ModeType mode, GoRouter router) {
     var next = state.copyWith(mode: mode);
     if (!state.rangeManuallySet) {
-      final now = DateTime.now();
+      final now = DateTime.now().toUtc();
       if (mode == ModeType.historical) {
         next = next.copyWith(rangeStart: now.subtract(const Duration(days: 365 * 3)), rangeEnd: now);
       } else if (mode == ModeType.climate) {
@@ -691,9 +702,14 @@ final dataProvider = FutureProvider.family<Map<String, dynamic>, FetchParams>((r
   final units = ref.watch(unitSettingsProvider);
   final lat = params.location.lat;
   final lon = params.location.lon;
-  final now = DateTime.now();
+  final now = DateTime.now().toUtc();
   final start = params.rangeStart;
   final end = params.rangeEnd;
+  // Per-mode past/future window limits -- see ModeCapability in models.dart.
+  // This replaces the old per-case hardcoded clamp numbers, which is what let
+  // Ensemble's clamp(0, 92) bug (real limit: 3 days) and Marine/AirQuality's
+  // entirely-missing forecastDays slip in without anything catching them.
+  final cap = modeCapabilities[params.mode];
 
   // How far into the past/future the master START/END fields reach, for the
   // "recent past + forecast horizon" style modes (Weather/Marine/AirQuality/
@@ -716,11 +732,14 @@ final dataProvider = FutureProvider.family<Map<String, dynamic>, FetchParams>((r
         locations: locations,
         daily: daily,
         hourly: hourly,
-        pastDays: pastDaysFrom(start).clamp(0, 92),
-        forecastDays: forecastDaysTo(end).clamp(0, 16),
+        pastDays: pastDaysFrom(start).clamp(0, cap!.maxPastDays),
+        forecastDays: forecastDaysTo(end).clamp(0, cap.maxFutureDays),
       );
     case ModeType.historical:
       final api = HistoricalApi(temperatureUnit: units.temperature, windspeedUnit: units.windspeed, precipitationUnit: units.precipitation);
+      // Range is already clamped to [1940-01-01, today] by resolveRange()
+      // before FetchParams was built (see _ModeView) -- this is just a
+      // last-line-of-defense guard against start ending up after end.
       final histEnd = end.isAfter(now) ? now : end;
       final histStart = start.isAfter(histEnd) ? histEnd : start;
       final locations = {OpenMeteoLocation(latitude: lat, longitude: lon, startDate: histStart, endDate: histEnd)};
@@ -733,26 +752,55 @@ final dataProvider = FutureProvider.family<Map<String, dynamic>, FetchParams>((r
     case ModeType.climate:
       final api = ClimateApi(models: {OpenMeteoModel.MRI_AGCM3_2_S}, temperatureUnit: units.temperature, windspeedUnit: units.windspeed, precipitationUnit: units.precipitation);
       final daily = params.fieldKeys.map((k) => ClimateDaily.values.firstWhere((v) => v.name == k)).toSet();
-      final climStart = start.isBefore(now) ? now : start;
-      final climEnd = end.isBefore(climStart) ? climStart : end;
-      final locations = {OpenMeteoLocation(latitude: lat, longitude: lon, startDate: climStart, endDate: climEnd)};
+      // Already clamped to [1950-01-01, 2050-01-01] upstream by resolveRange()
+      // -- a picked END of 2060 can no longer reach here at all.
+      final climEnd = end.isBefore(start) ? start : end;
+      final locations = {OpenMeteoLocation(latitude: lat, longitude: lon, startDate: start, endDate: climEnd)};
       return api.requestJson(locations: locations, daily: daily);
     case ModeType.marine:
       final api = MarineApi();
       final hourly = params.fieldKeys.map((k) => MarineHourly.values.firstWhere((v) => v.name == k)).toSet();
-      return api.requestJson(locations: {OpenMeteoLocation(latitude: lat, longitude: lon)}, hourly: hourly, pastDays: pastDaysFrom(start).clamp(0, 92));
+      return api.requestJson(
+        locations: {OpenMeteoLocation(latitude: lat, longitude: lon)},
+        hourly: hourly,
+        pastDays: pastDaysFrom(start).clamp(0, cap!.maxPastDays),
+        // BUG FIX: forecastDays was never sent, so a future END date did
+        // nothing -- the SDK silently fell back to its own default window.
+        forecastDays: forecastDaysTo(end).clamp(0, cap.maxFutureDays),
+      );
     case ModeType.airQuality:
       final api = AirQualityApi();
       final hourly = params.fieldKeys.map((k) => AirQualityHourly.values.firstWhere((v) => v.name == k)).toSet();
-      return api.requestJson(locations: {OpenMeteoLocation(latitude: lat, longitude: lon)}, hourly: hourly, pastDays: pastDaysFrom(start).clamp(0, 92));
+      return api.requestJson(
+        locations: {OpenMeteoLocation(latitude: lat, longitude: lon)},
+        hourly: hourly,
+        pastDays: pastDaysFrom(start).clamp(0, cap!.maxPastDays),
+        // Same missing-forecastDays bug as Marine.
+        forecastDays: forecastDaysTo(end).clamp(0, cap.maxFutureDays),
+      );
     case ModeType.flood:
       final api = FloodApi(ensemble: true);
       final daily = params.fieldKeys.map((k) => FloodDaily.values.firstWhere((v) => v.name == k)).toSet();
-      return api.requestJson(locations: {OpenMeteoLocation(latitude: lat, longitude: lon)}, daily: daily, pastDays: pastDaysFrom(start).clamp(0, 366));
+      // Flood has NO past-window support (see ModeCapability) -- only a
+      // 210-day forecast window. The old code sent a fabricated
+      // pastDays: clamp(0, 366), which isn't a real capability of this mode.
+      return api.requestJson(
+        locations: {OpenMeteoLocation(latitude: lat, longitude: lon)},
+        daily: daily,
+        forecastDays: forecastDaysTo(end).clamp(0, cap!.maxFutureDays),
+      );
     case ModeType.ensemble:
       final api = EnsembleApi(models: {OpenMeteoModel.icon_seamless}, temperatureUnit: units.temperature, windspeedUnit: units.windspeed, precipitationUnit: units.precipitation);
       final hourly = params.fieldKeys.map((k) => EnsembleHourly.values.firstWhere((v) => v.name == k)).toSet();
-      return api.requestJson(locations: {OpenMeteoLocation(latitude: lat, longitude: lon)}, hourly: hourly, pastDays: pastDaysFrom(start).clamp(0, 92));
+      return api.requestJson(
+        locations: {OpenMeteoLocation(latitude: lat, longitude: lon)},
+        hourly: hourly,
+        // BUG FIX: was clamp(0, 92) -- Ensemble's archive only keeps 3 days
+        // of past history, so most of that range silently returned nothing.
+        pastDays: pastDaysFrom(start).clamp(0, cap!.maxPastDays),
+        // BUG FIX: forecastDays was never sent at all.
+        forecastDays: forecastDaysTo(end).clamp(0, cap.maxFutureDays),
+      );
     case ModeType.elevation:
     case ModeType.geocoding:
       return {};

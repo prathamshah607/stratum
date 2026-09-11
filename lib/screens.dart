@@ -46,6 +46,8 @@ String _formatTableTime(DateTime d) {
   return '$y-$mo-$da $h:$mi';
 }
 
+bool _outsideWindow(DateTime d, DateTime start, DateTime end) => d.isBefore(start) || d.isAfter(end);
+
 /// The tabbed modes shown in the dashboard. Elevation and Location (the two
 /// single-value metadata lookups, formerly shown as a "meta" tab that just
 /// pointed back at the header) are dropped entirely -- their data already
@@ -417,6 +419,13 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> with SingleTi
     var currentIndex = _tabModes.indexOf(appState.mode);
     if (currentIndex < 0) currentIndex = 0;
     _builtTabs.add(currentIndex);
+    final dateBounds = modePickerBounds(appState.mode);
+    // Probe resolveRange with "hourly requested" to find out whether the
+    // CURRENT mode + current start/end would actually get hourly data --
+    // false for daily-only modes (Climate/Flood) and for any span already
+    // forced to daily by the >1-year rule. Only then does a time-of-day
+    // picker make sense; picking an hour for a daily aggregate is noise.
+    final allowTimeOfDay = ref.watch(resolvedRangeProvider(appState.mode)).resolution == TemporalResolution.hourly;
     if (_tabController.index != currentIndex) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _tabController.index = currentIndex;
@@ -430,12 +439,16 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen> with SingleTi
         surfaceTintColor: Colors.transparent,
         elevation: 0,
         titleSpacing: 20,
-        toolbarHeight: 68,
+        toolbarHeight: 80,
         title: _AppBarLocationInfo(location: appState.location!),
         actions: [
           DateRangeBar(
             start: appState.rangeStart,
             end: appState.rangeEnd,
+            firstSelectableDate: dateBounds.floor,
+            lastSelectableDate: dateBounds.ceiling,
+            allowTimeOfDay: allowTimeOfDay,
+            constraintLabel: modeRangeLabel(appState.mode),
             onStartChanged: (d) => ref.read(appStateProvider.notifier).setRangeStart(d, router),
             onEndChanged: (d) => ref.read(appStateProvider.notifier).setRangeEnd(d, router),
           ),
@@ -540,22 +553,21 @@ class _ModeView extends ConsumerWidget {
     if (appState.location == null) return const SizedBox.shrink();
     final units = ref.watch(unitSettingsProvider);
     final fields = ref.watch(activeFieldsProvider(mode));
-    final longRange = isLongRange(appState.rangeStart, appState.rangeEnd);
-    final rawResolution = mode == ModeType.weather
-        ? appState.weatherResolution
-        : mode == ModeType.historical
-            ? appState.historicalResolution
-            : TemporalResolution.hourly;
-    // Past a 1-year window, hourly is off the table entirely -- forced to
-    // daily regardless of what the toggle was last set to, which is what
-    // actually keeps a 5-10Y Historical/Weather range from trying to pull
-    // (and then render) tens of thousands of hourly rows per field.
-    final resolution = longRange ? TemporalResolution.daily : rawResolution;
+    // Single source of truth for window clamping + hourly/daily decision --
+    // resolvedRangeProvider (providers.dart) wraps ModeCapability/
+    // resolveRange (models.dart) in a Riverpod provider so THIS read and
+    // activeFieldsProvider's read are the exact same computation, not two
+    // independent resolveRange() calls that could disagree at a day
+    // boundary and request hourly field keys against a daily fetch (or
+    // vice versa).
+    final resolved = ref.watch(resolvedRangeProvider(mode));
+    final resolution = resolved.resolution;
+    final longRange = resolved.longRange;
     final params = FetchParams(
       mode: mode,
       location: appState.location!,
-      rangeStart: appState.rangeStart,
-      rangeEnd: appState.rangeEnd,
+      rangeStart: resolved.start,
+      rangeEnd: resolved.end,
       fieldKeys: [for (final f in fields) f.jsonKey],
       unitsKey: units.key,
       resolution: resolution,
@@ -594,7 +606,7 @@ class _ModeView extends ConsumerWidget {
           child: asyncData.when(
             loading: () => const Center(child: CircularProgressIndicator()),
             error: (e, _) => Center(child: Text('Error: $e', style: monoStyle.copyWith(color: theme.AppColors.red))),
-            data: (data) => _ModeGrid(mode: mode, fields: fields, data: data, units: units, resolution: resolution, longRange: longRange),
+            data: (data) => _ModeGrid(mode: mode, fields: fields, data: data, units: units, resolution: resolution, longRange: longRange, rangeStart: resolved.start, rangeEnd: resolved.end),
           ),
         ),
       ],
@@ -686,7 +698,15 @@ class _ModeGrid extends ConsumerWidget {
   final UnitSettings units;
   final TemporalResolution resolution;
   final bool longRange;
-  const _ModeGrid({required this.mode, required this.fields, required this.data, required this.units, required this.resolution, required this.longRange});
+  /// Exact (possibly hour-precision) window the user picked -- see
+  /// DateRangeBar's time-of-day picker in range_selector.dart. The API's
+  /// pastDays/forecastDays params only have day granularity, so the fetch
+  /// can return a bit more than this; every series helper below trims back
+  /// down to this exact window so picking a time actually changes what's
+  /// drawn, not just what's fetched.
+  final DateTime rangeStart;
+  final DateTime rangeEnd;
+  const _ModeGrid({required this.mode, required this.fields, required this.data, required this.units, required this.resolution, required this.longRange, required this.rangeStart, required this.rangeEnd});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -703,9 +723,21 @@ class _ModeGrid extends ConsumerWidget {
         ? ((resolution == TemporalResolution.daily ? data['daily'] : data['hourly']) as Map<String, dynamic>?) ?? {}
         : (data['hourly'] as Map<String, dynamic>?) ?? (data['daily'] as Map<String, dynamic>?) ?? {};
 
+    bool inWindow(DateTime d) => !d.isBefore(rangeStart) && !d.isAfter(rangeEnd);
+
     List<num> validValues(String jsonKey) {
-      final raw = (series[jsonKey] as List?)?.cast<num?>() ?? [];
-      final filtered = [for (final v in raw) if (v != null) v];
+      final rawTimes = (series['time'] as List?) ?? [];
+      final raw = (series[jsonKey] as List?) ?? [];
+      final filtered = <num>[];
+      for (var i = 0; i < raw.length; i++) {
+        final v = raw[i];
+        if (v == null) continue;
+        if (i < rawTimes.length && rawTimes[i] is num) {
+          final d = DateTime.fromMillisecondsSinceEpoch((rawTimes[i] as num).toInt() * 1000, isUtc: true);
+          if (!inWindow(d)) continue;
+        }
+        if (v is num) filtered.add(v);
+      }
       return _strideKeep(filtered, _strideFor(filtered.length));
     }
 
@@ -713,14 +745,18 @@ class _ModeGrid extends ConsumerWidget {
     // height + direction for the rose) -- filtering each independently can
     // desync index i whenever one has a null the other doesn't.
     (List<double>, List<double>) pairedValues(String keyA, String keyB) {
+      final rawTimes = (series['time'] as List?) ?? [];
       final a = (series[keyA] as List?) ?? [];
       final b = (series[keyB] as List?) ?? [];
       final outA = <double>[], outB = <double>[];
       for (var i = 0; i < a.length && i < b.length; i++) {
-        if (a[i] is num && b[i] is num) {
-          outA.add((a[i] as num).toDouble());
-          outB.add((b[i] as num).toDouble());
+        if (a[i] is! num || b[i] is! num) continue;
+        if (i < rawTimes.length && rawTimes[i] is num) {
+          final d = DateTime.fromMillisecondsSinceEpoch((rawTimes[i] as num).toInt() * 1000, isUtc: true);
+          if (!inWindow(d)) continue;
         }
+        outA.add((a[i] as num).toDouble());
+        outB.add((b[i] as num).toDouble());
       }
       final stride = _strideFor(outA.length);
       return (_strideKeep(outA, stride), _strideKeep(outB, stride));
@@ -739,7 +775,9 @@ class _ModeGrid extends ConsumerWidget {
         final t = rawTimes[i];
         final v = rawValues[i];
         if (t is num && v is num) {
-          dates.add(DateTime.fromMillisecondsSinceEpoch(t.toInt() * 1000, isUtc: true));
+          final d = DateTime.fromMillisecondsSinceEpoch(t.toInt() * 1000, isUtc: true);
+          if (!inWindow(d)) continue;
+          dates.add(d);
           values.add(v.toDouble());
         }
       }
@@ -753,7 +791,7 @@ class _ModeGrid extends ConsumerWidget {
     // keep line/bar charts fast) buys it nothing and actively hurts it: it
     // was dropping ~2 of every 3 days, leaving gaps in the year rows that
     // read as a false monthly-reset/sawtooth pattern. The heatmap always
-    // gets the full, un-thinned series instead.
+    // gets the full, un-thinned series instead (still windowed, just not strided).
     (List<DateTime>, List<double>) pairedSeriesFull(String jsonKey) {
       final rawTimes = (series['time'] as List?) ?? [];
       final rawValues = (series[jsonKey] as List?) ?? [];
@@ -763,7 +801,9 @@ class _ModeGrid extends ConsumerWidget {
         final t = rawTimes[i];
         final v = rawValues[i];
         if (t is num && v is num) {
-          dates.add(DateTime.fromMillisecondsSinceEpoch(t.toInt() * 1000, isUtc: true));
+          final d = DateTime.fromMillisecondsSinceEpoch(t.toInt() * 1000, isUtc: true);
+          if (!inWindow(d)) continue;
+          dates.add(d);
           values.add(v.toDouble());
         }
       }
@@ -772,7 +812,11 @@ class _ModeGrid extends ConsumerWidget {
 
     List<DateTime> allDates() {
       final rawTimes = (series['time'] as List?) ?? [];
-      return [for (final t in rawTimes) if (t is num) DateTime.fromMillisecondsSinceEpoch(t.toInt() * 1000, isUtc: true)];
+      return [
+        for (final t in rawTimes)
+          if (t is num)
+            DateTime.fromMillisecondsSinceEpoch(t.toInt() * 1000, isUtc: true)
+      ].where(inWindow).toList();
     }
 
     final primary = fields.where((f) => f.tier == FieldTier.primary).toList();
@@ -1135,12 +1179,8 @@ class _RawDataTableViewState extends ConsumerState<_RawDataTableView> {
     if (appState.location == null) return const SizedBox.shrink();
     final units = ref.watch(unitSettingsProvider);
     final fields = ref.watch(activeFieldsProvider(widget.mode));
-    final rawResolution = widget.mode == ModeType.weather
-        ? appState.weatherResolution
-        : widget.mode == ModeType.historical
-            ? appState.historicalResolution
-            : TemporalResolution.hourly;
-    final resolution = isLongRange(appState.rangeStart, appState.rangeEnd) ? TemporalResolution.daily : rawResolution;
+    final resolved = ref.watch(resolvedRangeProvider(widget.mode));
+    final resolution = resolved.resolution;
     // Identical FetchParams to whatever the graph grid for this mode is
     // already fetching with -- dataProvider's keepAlive cache serves this
     // from the exact same in-flight or completed request, so showing the
@@ -1148,8 +1188,8 @@ class _RawDataTableViewState extends ConsumerState<_RawDataTableView> {
     final params = FetchParams(
       mode: widget.mode,
       location: appState.location!,
-      rangeStart: appState.rangeStart,
-      rangeEnd: appState.rangeEnd,
+      rangeStart: resolved.start,
+      rangeEnd: resolved.end,
       fieldKeys: [for (final f in fields) f.jsonKey],
       unitsKey: units.key,
       resolution: resolution,
@@ -1159,23 +1199,95 @@ class _RawDataTableViewState extends ConsumerState<_RawDataTableView> {
     return asyncData.when(
       loading: () => const Center(child: CircularProgressIndicator()),
       error: (e, _) => Center(child: Text('Error: $e', style: monoStyle.copyWith(color: theme.AppColors.red))),
-      data: (data) => _buildTable(appState, data, fields, units, resolution),
+      data: (data) => _buildTable(appState, data, fields, units, resolution, resolved.start, resolved.end),
     );
   }
 
-  Widget _buildTable(AppState appState, Map<String, dynamic> data, List<FieldSpec> fields, UnitSettings units, TemporalResolution resolution) {
+  Widget _buildTable(AppState appState, Map<String, dynamic> data, List<FieldSpec> fields, UnitSettings units, TemporalResolution resolution, DateTime windowStart, DateTime windowEnd) {
     final series = widget.mode == ModeType.weather
         ? ((resolution == TemporalResolution.daily ? data['daily'] : data['hourly']) as Map<String, dynamic>?) ?? {}
         : (data['hourly'] as Map<String, dynamic>?) ?? (data['daily'] as Map<String, dynamic>?) ?? {};
     final rawTimes = (series['time'] as List?) ?? [];
+    // pastDays/forecastDays only have day granularity, so the fetch can
+    // return a bit more than the person actually picked (including a
+    // specific hour via the time-of-day picker in DateRangeBar) -- trim
+    // back down to the exact window here. validIndices maps each surviving
+    // table row back to its ORIGINAL position in the series lists, since
+    // valueAt() below still needs to index into the untouched series.
+    final validIndices = <int>[
+      for (var i = 0; i < rawTimes.length; i++)
+        if (rawTimes[i] is! num || !_outsideWindow(DateTime.fromMillisecondsSinceEpoch((rawTimes[i] as num).toInt() * 1000, isUtc: true), windowStart, windowEnd)) i
+    ];
     final times = [
-      for (final t in rawTimes)
-        if (t is num) _formatTableTime(DateTime.fromMillisecondsSinceEpoch(t.toInt() * 1000, isUtc: true)) else '$t'
+      for (final idx in validIndices)
+        if (rawTimes[idx] is num) _formatTableTime(DateTime.fromMillisecondsSinceEpoch((rawTimes[idx] as num).toInt() * 1000, isUtc: true)) else '${rawTimes[idx]}'
     ];
     final visibleFields = fields.where((f) => !hiddenColumns.contains(f.jsonKey)).toList();
-    final columns = ['time', for (final f in visibleFields) '${f.label} (${f.unitLabel(units)})'];
+    final isEnsemble = widget.mode == ModeType.ensemble;
 
-    var rows = <List<dynamic>>[for (var i = 0; i < times.length; i++) [times[i], for (final f in visibleFields) (series[f.jsonKey] as List?)?[i]]];
+    // Ordinary APIs expose one list per base field (`temperature_2m`, etc.).
+    // Ensemble exposes an extra dimension in the key instead:
+    // `temperature_2m_member00` ... `temperature_2m_memberNN`. Preserve that
+    // dimension in the raw table rather than looking up the absent base key
+    // (which previously produced a column full of blank/null cells).
+    final memberIndexes = <int>{};
+    if (isEnsemble) {
+      final memberPattern = RegExp(r'_member(\d+)$');
+      for (final key in series.keys) {
+        final match = memberPattern.firstMatch(key);
+        if (match != null) memberIndexes.add(int.parse(match.group(1)!));
+      }
+    }
+    final orderedMembers = memberIndexes.toList()..sort();
+
+    final columns = [
+      'time',
+      if (orderedMembers.isNotEmpty) 'member',
+      for (final f in visibleFields) '${f.label} (${f.unitLabel(units)})',
+    ];
+
+    dynamic valueAt(String key, int index) {
+      final values = series[key];
+      final origIndex = validIndices[index];
+      return values is List && origIndex < values.length ? values[origIndex] : null;
+    }
+
+    var rows = <List<dynamic>>[];
+    if (orderedMembers.isNotEmpty) {
+      for (var i = 0; i < times.length; i++) {
+        for (final memberIndex in orderedMembers) {
+          final member = 'member${memberIndex.toString().padLeft(2, '0')}';
+          final values = [for (final f in visibleFields) valueAt('${f.jsonKey}_$member', i)];
+          // Different ensemble models can expose different member counts.
+          // Do not manufacture an entirely empty row for a missing member.
+          if (values.isEmpty || values.any((value) => value != null)) {
+            rows.add([times[i], member, ...values]);
+          }
+        }
+      }
+    } else {
+      rows = [
+        for (var i = 0; i < times.length; i++)
+          [times[i], for (final f in visibleFields) valueAt(f.jsonKey, i)],
+      ];
+    }
+
+    // Compute each numeric column's mean from the complete, unfiltered data.
+    // Searching and sorting must not move the threshold or recolor cells.
+    final columnMeans = <int, double>{};
+    for (var column = 0; column < columns.length; column++) {
+      var sum = 0.0;
+      var count = 0;
+      for (final row in rows) {
+        if (column >= row.length) continue;
+        final value = row[column];
+        if (value is num && value.isFinite) {
+          sum += value.toDouble();
+          count++;
+        }
+      }
+      if (count > 0) columnMeans[column] = sum / count;
+    }
 
     if (search.isNotEmpty) {
       final q = search.toLowerCase();
@@ -1261,7 +1373,7 @@ class _RawDataTableViewState extends ConsumerState<_RawDataTableView> {
                         : ListView.builder(
                             itemCount: rows.length,
                             itemExtent: 30,
-                            itemBuilder: (context, i) => _dataRow(rows[i], i),
+                            itemBuilder: (context, i) => _dataRow(rows[i], i, columnMeans),
                           ),
                   ),
                 ],
@@ -1302,16 +1414,27 @@ class _RawDataTableViewState extends ConsumerState<_RawDataTableView> {
     );
   }
 
-  Widget _dataRow(List<dynamic> row, int i) {
+  Widget _dataRow(List<dynamic> row, int i, Map<int, double> columnMeans) {
     return Container(
       color: i.isEven ? bgColor : panelColor,
       child: Row(children: [
-        for (final v in row)
+        for (var column = 0; column < row.length; column++)
           SizedBox(
             width: _colWidth,
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 6),
-              child: Text(v == null ? '' : '$v', style: monoStyle.copyWith(fontSize: 11, color: theme.AppColors.white), overflow: TextOverflow.ellipsis),
+              child: Text(
+                row[column] == null ? '' : '${row[column]}',
+                style: monoStyle.copyWith(
+                  fontSize: 11,
+                  color: row[column] is num && columnMeans[column] != null
+                      ? ((row[column] as num).toDouble() > columnMeans[column]!
+                          ? theme.AppColors.red
+                          : theme.AppColors.green)
+                      : theme.AppColors.white,
+                ),
+                overflow: TextOverflow.ellipsis,
+              ),
             ),
           ),
       ]),

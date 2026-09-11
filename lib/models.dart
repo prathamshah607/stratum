@@ -187,3 +187,117 @@ class FetchParams {
   @override
   int get hashCode => Object.hash(mode, location.lat, location.lon, rangeStart, rangeEnd, fieldKeys.join(','), unitsKey, resolution);
 }
+
+// ---------------------------------------------------------------------------
+// ModeCapability / resolveRange -- the single source of truth for "what
+// date window + resolution is this mode actually allowed to request".
+// Both the data-fetch layer (providers.dart's dataProvider) and the UI
+// (range_selector.dart's date pickers, screens.dart's hourly/daily toggle)
+// call resolveRange()/modePickerBounds() instead of each independently
+// guessing at day-count clamps -- that drift is what caused the Ensemble
+// pastDays bug and the missing Marine/AirQuality forecastDays in the first
+// place.
+// ---------------------------------------------------------------------------
+
+class ModeCapability {
+  /// Whether this mode has an hourly resolution at all (vs. daily-only).
+  final bool supportsHourly;
+  /// Relative past window in days (pastDays-style param). 0 = not supported.
+  final int maxPastDays;
+  /// Relative future window in days (forecastDays-style param). 0 = not supported.
+  final int maxFutureDays;
+  /// Absolute earliest selectable date, if the mode has a fixed archive start.
+  final DateTime? calendarFloor;
+  /// Absolute latest selectable date, if the mode has a fixed forecast horizon.
+  /// Null + Historical means "today" (resolved dynamically, not baked in here).
+  final DateTime? calendarCeiling;
+  const ModeCapability({required this.supportsHourly, this.maxPastDays = 0, this.maxFutureDays = 0, this.calendarFloor, this.calendarCeiling});
+}
+
+/// One row per mode, taken directly from the verified Open-Meteo capability
+/// table: resolution support, relative past/future windows, and absolute
+/// calendar bounds where the mode has an archive/forecast-horizon limit.
+final Map<ModeType, ModeCapability> modeCapabilities = {
+  ModeType.weather: ModeCapability(supportsHourly: true, maxPastDays: 92, maxFutureDays: 16),
+  ModeType.historical: ModeCapability(supportsHourly: true, calendarFloor: DateTime.utc(1940, 1, 1)), // ceiling = "today", resolved in modePickerBounds
+  ModeType.climate: ModeCapability(supportsHourly: false, calendarFloor: DateTime.utc(1950, 1, 1), calendarCeiling: DateTime.utc(2050, 1, 1)),
+  ModeType.marine: ModeCapability(supportsHourly: true, maxPastDays: 92, maxFutureDays: 8),
+  ModeType.airQuality: ModeCapability(supportsHourly: true, maxPastDays: 92, maxFutureDays: 7),
+  ModeType.flood: ModeCapability(supportsHourly: false, maxFutureDays: 210, calendarFloor: DateTime.utc(1984, 1, 1)), // no past window at all
+  ModeType.ensemble: ModeCapability(supportsHourly: true, maxPastDays: 3, maxFutureDays: 35), // archive is only 3 days, NOT 92
+};
+
+/// Absolute [floor, ceiling] a date picker for this mode may select --
+/// combines the mode's fixed calendar bounds (if any) with its relative
+/// past/future windows (if any). Every mode in the table above resolves to
+/// a concrete floor AND ceiling this way, so callers never need a fallback.
+({DateTime floor, DateTime ceiling}) modePickerBounds(ModeType mode, {DateTime? now}) {
+  final cap = modeCapabilities[mode]!;
+  final raw = (now ?? DateTime.now()).toUtc();
+  // Truncate to the start of the UTC day. pastDays/forecastDays are
+  // day-granularity anyway, so nothing is lost -- but WITHOUT this, any
+  // mode whose window is exceeded by the current start/end (Marine's
+  // 8-day future window, Air Quality's 7-day, Ensemble's 3-day past, or
+  // Flood whenever the global range is still sitting at Climate's +3y
+  // default from an earlier tab) recomputes a microsecond-different clamp
+  // on every single rebuild. That becomes a new FetchParams every time,
+  // which refetches, which rebuilds on completion, which computes a new
+  // `now`, forever -- an infinite fetch loop that just looks like
+  // "loading forever" in the UI. Truncating to the day makes the bound
+  // stable for the whole day, so identical builds produce identical
+  // FetchParams and the fetch actually completes and caches. UTC (not
+  // local) because every timestamp elsewhere in the app -- API responses,
+  // table rows, chart axes -- is UTC; computing this floor/ceiling from
+  // local midnight silently shifted it by the device's UTC offset.
+  final n = DateTime.utc(raw.year, raw.month, raw.day);
+  var floor = cap.calendarFloor ?? DateTime.utc(1900);
+  var ceiling = cap.calendarCeiling ?? (mode == ModeType.historical ? n : DateTime.utc(2100));
+  if (cap.maxPastDays > 0) {
+    final pastFloor = n.subtract(Duration(days: cap.maxPastDays));
+    if (pastFloor.isAfter(floor)) floor = pastFloor;
+  }
+  if (cap.maxFutureDays > 0) {
+    final futureCeiling = n.add(Duration(days: cap.maxFutureDays));
+    if (futureCeiling.isBefore(ceiling)) ceiling = futureCeiling;
+  }
+  return (floor: floor, ceiling: ceiling);
+}
+
+class ResolvedRange {
+  final DateTime start;
+  final DateTime end;
+  final TemporalResolution resolution;
+  final bool longRange;
+  const ResolvedRange({required this.start, required this.end, required this.resolution, required this.longRange});
+}
+
+/// Clamps [requestedStart, requestedEnd] into the mode's real window (see
+/// modePickerBounds) and decides hourly vs. daily. Any range over a year --
+/// after clamping -- is ALWAYS forced to daily, no matter what the mode's
+/// own toggle was set to; a mode with no hourly support at all is always
+/// daily regardless of span. This is the ONLY place that decision is made.
+ResolvedRange resolveRange({required ModeType mode, required DateTime requestedStart, required DateTime requestedEnd, required TemporalResolution requestedResolution, DateTime? now}) {
+  final cap = modeCapabilities[mode]!;
+  final bounds = modePickerBounds(mode, now: now);
+  var start = requestedStart.isBefore(bounds.floor)
+      ? DateTime(bounds.floor.year, bounds.floor.month, bounds.floor.day, requestedStart.hour, requestedStart.minute)
+      : requestedStart;
+  var end = requestedEnd.isAfter(bounds.ceiling)
+      ? DateTime(bounds.ceiling.year, bounds.ceiling.month, bounds.ceiling.day, requestedEnd.hour, requestedEnd.minute)
+      : requestedEnd;
+  if (end.isBefore(start)) end = start;
+  final longRange = end.difference(start).inDays.abs() > 365;
+  final resolution = (!cap.supportsHourly || longRange) ? TemporalResolution.daily : requestedResolution;
+  return ResolvedRange(start: start, end: end, resolution: resolution, longRange: longRange);
+}
+
+/// Human-readable summary of a mode's currently selectable window, e.g.
+/// "AVAILABLE 2026-06-11 → 2026-09-19" -- shown directly under the
+/// START/END fields (and as the date picker dialog's helpText) so a
+/// limitation is visible before the person even opens the calendar,
+/// instead of only being enforced silently inside it.
+String modeRangeLabel(ModeType mode, {DateTime? now}) {
+  final b = modePickerBounds(mode, now: now);
+  String fmt(DateTime d) => '${d.year}-${d.month.toString().padLeft(2, '0')}-${d.day.toString().padLeft(2, '0')}';
+  return 'AVAILABLE ${fmt(b.floor)} \u2192 ${fmt(b.ceiling)}';
+}
