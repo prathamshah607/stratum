@@ -25,7 +25,6 @@
 // so hovering never costs a repaint of the (expensive-to-draw) canvas.
 
 import 'package:flutter/material.dart';
-import 'package:flutter/rendering.dart';
 import 'theme.dart';
 
 class CalendarHeatmap extends StatefulWidget {

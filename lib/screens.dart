@@ -7,12 +7,10 @@
 // data panel toggleable from the app bar.
 
 import 'package:flutter/material.dart';
-import 'package:flutter/gestures.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:fl_chart/fl_chart.dart';
-import 'package:go_router/go_router.dart';
 import 'dart:convert';
 import 'dart:js_interop';
 import 'package:csv/csv.dart';

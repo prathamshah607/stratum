@@ -24,7 +24,7 @@ import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'theme.dart';
 import 'weather_codes.dart';
-import 'widgets.dart' show planAxisLabels, AxisLabelPlan, indianFullDateTime;
+import 'widgets.dart' show planAxisLabels, AxisLabelPlan;
 
 // ---------------------------------------------------------------------------
 // MetricPanel

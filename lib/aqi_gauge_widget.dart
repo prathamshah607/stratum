@@ -20,7 +20,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:fl_chart/fl_chart.dart';
 import 'theme.dart';
-import 'widgets.dart' show planAxisLabels, indianFullDateTime;
+import 'widgets.dart' show planAxisLabels;
 
 class AqiGauge extends StatelessWidget {
   final double? current;
